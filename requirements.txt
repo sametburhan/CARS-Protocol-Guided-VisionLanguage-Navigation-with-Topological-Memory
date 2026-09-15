@@ -1,0 +1,6 @@
+fastmcp==2.14.2
+mcp==1.25.0
+roslibpy==2.0.0
+opencv-python>=4.5,<5
+numpy==1.26.4
+Pillow==10.1.0
