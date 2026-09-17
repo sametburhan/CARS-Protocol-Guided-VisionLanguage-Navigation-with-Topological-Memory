@@ -86,11 +86,12 @@ TEST_SONUC=$?
 
 echo ""
 echo "=========================================================="
-if [ "$TEST_SONUC" -eq 0 ]; then
-    echo "✅ TÜM TESTLER BAŞARILI"
-else
-    echo "❌ BAZI TESTLER BAŞARISIZ (yukarıdaki detaylara bak)"
-fi
+case "$TEST_SONUC" in
+    0) echo "✅ TÜM TESTLER BAŞARILI (atlanan yok)" ;;
+    3) echo "⚠️ TESTLER EKSİK: Atlanan senaryolar var; tamamı doğrulanmadı." ;;
+    1) echo "❌ BAZI TESTLER BAŞARISIZ (yukarıdaki detaylara bak)" ;;
+    *) echo "❌ TEST PAKETİ ÇALIŞTIRMA HATASI (kod: $TEST_SONUC)" ;;
+esac
 echo "=========================================================="
 
 exit "$TEST_SONUC"

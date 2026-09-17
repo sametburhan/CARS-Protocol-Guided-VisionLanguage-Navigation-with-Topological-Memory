@@ -1,3 +1,4 @@
+from experiment_log import logged_tool
 from fastmcp import FastMCP
 import mcp.types as types
 import roslibpy
@@ -11,9 +12,6 @@ import time
 import json
 
 _BU_DOSYANIN_KONUMU = os.path.dirname(os.path.abspath(__file__))
-LOG_KLASORU = os.path.normpath(os.path.join(_BU_DOSYANIN_KONUMU, "..", "logs"))
-os.makedirs(LOG_KLASORU, exist_ok=True)
-RUN_MARKER_DOSYASI = os.path.join(LOG_KLASORU, "current_run.txt")
 mcp = FastMCP("Kamera_Merkezi")
 
 # ==========================================
@@ -23,37 +21,6 @@ ros_client = roslibpy.Ros(host='127.0.0.1', port=9090)
 # KÖK ÇÖZÜM 1: Topic objesini her çağrıda yaratmak yerine BİR KERE yaratıyoruz.
 camera_topic = roslibpy.Topic(ros_client, '/camera/image_raw', 'sensor_msgs/msg/Image', queue_length=1)
 
-def _run_log_dosyasini_al():
-    """
-    Tüm MCP sunucularının (otopilot, kamera, lidar, kartograf, bellek) AYNI
-    deney/oturum log dosyasına yazmasını sağlar. İlk açılan sunucu bir run ID
-    oluşturur ve marker dosyasına yazar; sonrakiler bunu okuyup kullanır.
-    """
-    if os.path.exists(RUN_MARKER_DOSYASI):
-        with open(RUN_MARKER_DOSYASI, "r") as f:
-            run_id = f.read().strip()
-    else:
-        run_id = time.strftime('%Y%m%d_%H%M%S')
-        with open(RUN_MARKER_DOSYASI, "w") as f:
-            f.write(run_id)
-    return os.path.join(LOG_KLASORU, f"run_{run_id}.jsonl")
-
-RUN_LOG_DOSYASI = _run_log_dosyasini_al()
-
-def _log_yaz(sunucu_adi, tool_adi, girdi: dict, cikti_ozet, sure_saniye: float = None):
-    try:
-        kayit = {
-            "zaman": time.strftime('%Y-%m-%d %H:%M:%S'),
-            "sunucu": sunucu_adi,
-            "tool": tool_adi,
-            "girdi": girdi,
-            "cikti_ozet": (cikti_ozet[:300] if isinstance(cikti_ozet, str) else str(cikti_ozet)),
-            "sure_s": round(sure_saniye, 3) if sure_saniye is not None else None,
-        }
-        with open(RUN_LOG_DOSYASI, "a", encoding="utf-8") as f:
-            f.write(json.dumps(kayit, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"⚠️ Log yazılamadı: {e}")
 
 def baglantiyi_garantiye_al():
     """ROS bağlantısının koptuğu durumlarda otomatik yeniden bağlanmayı sağlar."""
@@ -74,6 +41,7 @@ if ros_client.is_connected:
 # 🛠️ BUFFER'SIZ ARAÇLAR (ON-DEMAND)
 # ==========================================
 @mcp.tool()
+@logged_tool("Kamera_Merkezi")
 def detayli_analiz_kamerasi_al():
     """
     Odadaki MOBİLYALARI, objeleri ve uzaktaki ince detayları tanımak için bu aracı kullan.
@@ -85,7 +53,6 @@ def detayli_analiz_kamerasi_al():
 
     if not ros_client.is_connected:           # 🆕
         sonuc = "🛑 HATA: ROS bağlantısı yok, kamera görüntüsü alınamıyor."
-        _log_yaz("Kamera_Merkezi", "detayli_analiz_kamerasi_al", {}, sonuc, time.time() - baslangic)
         return sonuc
 
     anlik_veri = {"msg": None}
@@ -109,7 +76,6 @@ def detayli_analiz_kamerasi_al():
         if (time.time() - start) > timeout:
             topic.unsubscribe()
             sonuc = "HATA: Detaylı (Raw) kameradan veri alınamadı."
-            _log_yaz("Kamera_Merkezi", "detayli_analiz_kamerasi_al", {}, sonuc, time.time() - baslangic)
             return sonuc
         time.sleep(0.05)
 
@@ -132,16 +98,15 @@ def detayli_analiz_kamerasi_al():
         buffer = io.BytesIO()
         img_pil.save(buffer, format="JPEG", quality=85, optimize=True)
         
-        _log_yaz("Kamera_Merkezi", "detayli_analiz_kamerasi_al", {}, "Görüntü başarıyla alındı.", time.time() - baslangic)
         return types.TextContent(type="text", text="[GÖRSEL KAYNAĞI: Detaylı Analiz Kamerası]")
 
     except Exception as e:
         sonuc = f"HATA: Ham görüntü işlenirken hata oluştu: {str(e)}"
-        _log_yaz("Kamera_Merkezi", "detayli_analiz_kamerasi_al", {}, sonuc, time.time() - baslangic)
         return sonuc
 
 
 @mcp.tool()
+@logged_tool("Kamera_Merkezi")
 def hizli_kamera_al():
     """
     SADECE navigasyon, yön bulma ve boşluk/kapı tespiti için bu aracı kullan.
@@ -151,7 +116,6 @@ def hizli_kamera_al():
     baglantiyi_garantiye_al()                 # 🆕
     if not ros_client.is_connected:           # 🆕
         sonuc = "🛑 HATA: ROS bağlantısı yok, kamera görüntüsü alınamıyor."
-        _log_yaz("Kamera_Merkezi", "hizli_kamera_al", {}, sonuc, time.time() - baslangic)
         return sonuc
 
     anlik_veri = {"data": None}
@@ -177,7 +141,6 @@ def hizli_kamera_al():
         if (time.time() - start) > timeout:
             topic.unsubscribe()
             sonuc = "HATA: Hızlı kameradan veri alınamadı."
-            _log_yaz("Kamera_Merkezi", "hizli_kamera_al", {}, sonuc, time.time() - baslangic)
             return sonuc
         time.sleep(0.05)
         
@@ -185,7 +148,6 @@ def hizli_kamera_al():
     # Bu sayede arkada hiçbir bayat veri (buffer) birikemez.
     topic.unsubscribe()
 
-    _log_yaz("Kamera_Merkezi", "hizli_kamera_al", {}, "Görüntü başarıyla alındı.", time.time() - baslangic)
     return [
         types.TextContent(type="text", text="[GÖRSEL KAYNAĞI: RGB Hızlı Kamera]"),
         types.ImageContent(type="image", data=anlik_veri["data"], mimeType="image/jpeg")

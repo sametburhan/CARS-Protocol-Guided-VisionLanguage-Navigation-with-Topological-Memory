@@ -1,3 +1,4 @@
+from experiment_log import logged_tool
 from fastmcp import FastMCP
 import mcp.types as types # MCP standart tipleri
 import base64             # Resmi kodlamak için
@@ -12,9 +13,6 @@ import os
 import json
 
 _BU_DOSYANIN_KONUMU = os.path.dirname(os.path.abspath(__file__))
-LOG_KLASORU = os.path.normpath(os.path.join(_BU_DOSYANIN_KONUMU, "..", "logs"))
-os.makedirs(LOG_KLASORU, exist_ok=True)
-RUN_MARKER_DOSYASI = os.path.join(LOG_KLASORU, "current_run.txt")
 
 # 1. MCP Sunucusunu Başlat
 mcp = FastMCP("Lidar_Radar_Merkezi")
@@ -24,37 +22,6 @@ latest_scan_ranges = None
 son_lidar_guncelleme = None      
 MAX_SENSOR_YAS_SANIYE = 1.0      
 
-def _run_log_dosyasini_al():
-    """
-    Tüm MCP sunucularının (otopilot, kamera, lidar, kartograf, bellek) AYNI
-    deney/oturum log dosyasına yazmasını sağlar. İlk açılan sunucu bir run ID
-    oluşturur ve marker dosyasına yazar; sonrakiler bunu okuyup kullanır.
-    """
-    if os.path.exists(RUN_MARKER_DOSYASI):
-        with open(RUN_MARKER_DOSYASI, "r") as f:
-            run_id = f.read().strip()
-    else:
-        run_id = time.strftime('%Y%m%d_%H%M%S')
-        with open(RUN_MARKER_DOSYASI, "w") as f:
-            f.write(run_id)
-    return os.path.join(LOG_KLASORU, f"run_{run_id}.jsonl")
-
-RUN_LOG_DOSYASI = _run_log_dosyasini_al()
-
-def _log_yaz(sunucu_adi, tool_adi, girdi: dict, cikti_ozet, sure_saniye: float = None):
-    try:
-        kayit = {
-            "zaman": time.strftime('%Y-%m-%d %H:%M:%S'),
-            "sunucu": sunucu_adi,
-            "tool": tool_adi,
-            "girdi": girdi,
-            "cikti_ozet": (cikti_ozet[:300] if isinstance(cikti_ozet, str) else str(cikti_ozet)),
-            "sure_s": round(sure_saniye, 3) if sure_saniye is not None else None,
-        }
-        with open(RUN_LOG_DOSYASI, "a", encoding="utf-8") as f:
-            f.write(json.dumps(kayit, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"⚠️ Log yazılamadı: {e}")
 
 # ==========================================
 # 🌉 ROS 2 BAĞLANTISI (Rosbridge Üzerinden)
@@ -202,6 +169,7 @@ def generate_lidar_radar_visual_pil(scan_data, max_range=3.5, img_size=320):
 # 🛠️ CLAUDE İÇİN MCP ARACI
 # ==========================================
 @mcp.tool()
+@logged_tool("Lidar_Radar_Merkezi")
 def anlik_lidar_radar_haritasi_al():
     """
     Robotun 360 derece Lidar 'Radar' görüntüsünü alır.
@@ -214,7 +182,6 @@ def anlik_lidar_radar_haritasi_al():
 
     if not ros_client.is_connected:          # 🆕
         sonuc = "🛑 HATA: ROS bağlantısı yok, radar verisi alınamıyor."
-        _log_yaz("Lidar_Radar_Merkezi", "anlik_lidar_radar_haritasi_al", {}, sonuc, time.time() - baslangic)
         return sonuc
 
     # KÖKLÜ ÇÖZÜM: Her istekte yepyeni bir Lidar taraması garantilemek için eskiyi sil
@@ -227,19 +194,18 @@ def anlik_lidar_radar_haritasi_al():
     while latest_scan_ranges is None:
         if (time.time() - start) > timeout:
             sonuc = "HATA: Lidar verisi 10 saniye boyunca alınamadı. Rosbridge'in çalıştığından ve Gazebo'nun aktif olduğundan emin ol."
-            _log_yaz("Lidar_Radar_Merkezi", "anlik_lidar_radar_haritasi_al", {}, sonuc, time.time() - baslangic)
             return sonuc
         time.sleep(0.1) # Sistemi yormadan bekle
 
     pil_img = generate_lidar_radar_visual_pil(latest_scan_ranges)
     
-    _log_yaz("Lidar_Radar_Merkezi", "anlik_lidar_radar_haritasi_al", {}, "Görsel başarıyla üretildi.", time.time() - baslangic)
     return [
         types.TextContent(type="text", text="[GÖRSEL KAYNAĞI: 360° Lidar / Radar Haritası]"),
         _encode_image_to_imagecontent(pil_img)
     ]
 
 @mcp.tool()
+@logged_tool("Lidar_Radar_Merkezi")
 def gecit_genisligi_hesapla(hedef_aci_derece: float) -> str:
     baslangic = time.time()
     global latest_scan_ranges
@@ -247,24 +213,20 @@ def gecit_genisligi_hesapla(hedef_aci_derece: float) -> str:
 
     if not ros_client.is_connected:                     # 🆕
         sonuc = "🛑 HATA: ROS bağlantısı yok, geçit analizi yapılamıyor."
-        _log_yaz("Lidar_Radar_Merkezi", "gecit_genisligi_hesapla", {"hedef_aci_derece": hedef_aci_derece}, sonuc, time.time() - baslangic)
         return sonuc
 
     if latest_scan_ranges is None:
         sonuc = "HATA: Lidar verisi bulunamadı."
-        _log_yaz("Lidar_Radar_Merkezi", "gecit_genisligi_hesapla", {"hedef_aci_derece": hedef_aci_derece}, sonuc, time.time() - baslangic)
         return sonuc
 
     if not _lidar_verisi_taze_mi():                      # 🆕
         yas = time.time() - son_lidar_guncelleme
         sonuc = f"⚠️ UYARI: Lidar verisi {yas:.1f}s önce alınmış (bayat olabilir). Önce anlik_lidar_radar_haritasi_al ile taze veri al, sonra tekrar dene."
-        _log_yaz("Lidar_Radar_Merkezi", "gecit_genisligi_hesapla", {"hedef_aci_derece": hedef_aci_derece}, sonuc, time.time() - baslangic)
         return sonuc
         
     num_beams = len(latest_scan_ranges)
     if num_beams == 0:
         sonuc = "HATA: Lidar verisi boş."
-        _log_yaz("Lidar_Radar_Merkezi", "gecit_genisligi_hesapla", {"hedef_aci_derece": hedef_aci_derece}, sonuc, time.time() - baslangic)
         return sonuc
 
     GUVENLI_GENISLIK_M = 0.45
@@ -337,7 +299,6 @@ def gecit_genisligi_hesapla(hedef_aci_derece: float) -> str:
             f"açıyla hizalanmak için waypoint stratejisi uygula (bkz. protokol: Çapraz Yaklaşım Waypoint Kuralı)."
         )
 
-    _log_yaz("Lidar_Radar_Merkezi", "gecit_genisligi_hesapla", {"hedef_aci_derece": hedef_aci_derece}, rapor, time.time() - baslangic)
     return rapor
 
 if __name__ == "__main__":

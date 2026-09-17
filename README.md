@@ -141,13 +141,63 @@ Runtime state is intentionally excluded from version control:
 
 All five MCP servers use the same active JSONL file. The log and memory paths are resolved from each module's physical file location, so they do not depend on the shell's current working directory.
 
-The current v0.1 logger has two explicit limitations. `current_run.txt` is not automatically renewed between experiments, so create a new run identifier before each controlled experiment; otherwise separate experiments can be appended to the same JSONL file. In addition, logging is not yet applied to every MCP tool, so the JSONL file must not be described as a complete model/tool execution trace. For reproducible experiments, preserve the run log together with the scenario, initial pose, target, model/version, system variant, and outcome label.
+### Start a controlled experiment
+
+Before each experiment, from the repository root:
+
+```bash
+python3 modules/experiment_log.py --metadata '{"scenario":"direct_target","model":"exact-model-id","target":"chair","initial_pose":{"x":0,"y":0,"yaw":0},"protocol_revision":"git-commit","variant":"full"}'
+```
+
+The command prints a fresh run-id and atomically switches `logs/current_run.txt`.
+Use `--run-id video_01` for a named run; an existing ID is rejected to prevent
+accidental experiment mixing. This starts recording context; it does not launch
+Gazebo, move the robot, or clear memory. Preserve initial memory with your experiment.
+Restart the five MCP servers once after installing this code update. Subsequent
+run switches are picked up on every new tool call without restarting servers.
+Stop issuing calls and wait for outstanding calls before changing experiments.
+If a switch happens during a call, its end remains in the run where it started.
+Without a marker, the first call creates one shared automatic run; a controlled
+experiment must still explicitly start a fresh run. `CARS_LOG_DIR` optionally
+overrides the log directory; set the same absolute path for every server and CLI.
+
+All 18 currently registered tools across the five servers are instrumented:
+camera observation, LiDAR radar/passage/laser/safety measurements, memory reads
+and writes, pose/target/route calculations, autopilot motion, and map updates.
+Each invocation writes `tool_start` and `tool_end` events with the same `call_id`
+and `run_id`. `seq` is a process-safe, increasing event order within a run;
+read the `tool_start` rows in this order to reconstruct call entry order.
+Concurrent calls can overlap and complete in a different order. UTC timestamps,
+server/tool names, all bound inputs, elapsed seconds, and outputs or exceptions
+are retained. Sequence gaps can indicate an interrupted write. A start without
+an end indicates an unfinished or interrupted call.
+
+`tool_end.status=returned` only means the function returned: a returned sensor
+error, safety stop, or timeout remains visible in `cikti_ozet` and is **not** a
+success assertion. `status=exception` includes the exception type and message.
+Text results are preserved without the old 300-character truncation. Images
+are represented by MIME type, base64 length and SHA-256 of the base64 string;
+the JSONL does not archive image pixels. These are tool traces, not model
+reasoning traces; MCP requests rejected during schema validation before tool
+entry are outside this logger. Logging failures propagate rather than silently
+allowing an unrecorded invocation to begin. Filesystem locking uses Linux
+`flock`, matching the supported Ubuntu/WSL runtime.
+
+The durability harness starts a fresh run automatically and appends per-case
+`test_result` events plus a `test_summary`. Its exit codes are 0 (all passed,
+none skipped), 1 (failures), 2 (setup/import error), and 3 (incomplete/skipped).
+Run the isolated logging and summary regressions without Gazebo:
+
+```bash
+python3 -m unittest discover -s tests -p test_experiment_log.py -v
+```
 
 ## Repository structure
 
 ```text
 .
 |-- modules/
+|   |-- experiment_log.py
 |   |-- autopilot_mcp.py
 |   |-- camera_mcp.py
 |   |-- custom_memory_mcp.py
@@ -177,7 +227,7 @@ The current v0.1 logger has two explicit limitations. `current_run.txt` is not a
 - Runtime memory uses JSON files without transactional concurrency guarantees.
 - Behavior remains sensitive to the selected language model and protocol interpretation.
 - The current durability tests are an initial harness, not a complete verification suite.
-- The run marker is not automatically rotated and not every MCP tool is instrumented for JSONL logging yet.
+- Controlled experiments require the explicit start command; images and model reasoning are not archived in JSONL.
 - Dynamic obstacles, network latency, API cost, and sim-to-real transfer are not yet systematically evaluated.
 
 ## Planned evaluation

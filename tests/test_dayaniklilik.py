@@ -24,6 +24,12 @@ PROJE_KOK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODUL_KLASORU = os.path.join(PROJE_KOK, "modules")
 sys.path.insert(0, MODUL_KLASORU)
 
+from experiment_log import start_run, write_event
+from test_summary import summarize, motion_completed
+
+RUN_ID = start_run(metadata={"kind": "durability_tests"})
+print(f"Deney run-id: {RUN_ID}")
+SONUCLAR = []
 BASARILI = []
 BASARISIZ = []
 ATLANAN = []
@@ -34,6 +40,9 @@ def baslik(ad):
 
 
 def sonuc_yaz(ad, gecti, detay=""):
+    record = {"name": ad, "status": "passed" if gecti is True else "failed" if gecti is False else "skipped", "detail": detay}
+    SONUCLAR.append(record)
+    write_event(dict(record, event="test_result"), RUN_ID)
     if gecti is True:
         print(f"  ✅ BAŞARILI — {detay}")
         BASARILI.append(ad)
@@ -47,12 +56,7 @@ def sonuc_yaz(ad, gecti, detay=""):
 
 def _cagir(tool_obj, *args, **kwargs):
     """fastmcp sürüm farkına karşı: fonksiyonu doğrudan ya da .fn üzerinden çağırmayı dener."""
-    try:
-        return tool_obj(*args, **kwargs)
-    except TypeError:
-        if hasattr(tool_obj, "fn"):
-            return tool_obj.fn(*args, **kwargs)
-        raise
+    return getattr(tool_obj, "fn", tool_obj)(*args, **kwargs)
 
 
 # --------------------------------------------------------------------------
@@ -63,6 +67,7 @@ try:
     import autopilot_mcp as ap
 except Exception as e:
     print(f"❌ KRİTİK: autopilot_mcp.py import edilemedi: {e}")
+    write_event({"event": "test_summary", "status": "error", "exit_code": 2, "detail": str(e)}, RUN_ID)
     sys.exit(2)
 
 print("⏳ ROS bağlantısının ve ilk sensör verilerinin oturması için 3 saniye bekleniyor...")
@@ -86,7 +91,7 @@ try:
     sonuc = _cagir(ap.otopilot_kademeli_hareket, 0.0, 0.3)
     ap.ros_client = orijinal_ros_client  # HER DURUMDA geri yükle
 
-    gecti = ("HAREKET ENGELLENDİ" in sonuc) or ("🛑" in sonuc)
+    gecti = "HAREKET ENGELLENDİ" in sonuc and "ROS bağlantısı yok" in sonuc
     sonuc_yaz("1a-ROS_baglanti_yok", gecti, sonuc.splitlines()[0])
 except Exception as e:
     ap.ros_client = orijinal_ros_client
@@ -99,7 +104,7 @@ try:
     sonuc = _cagir(ap.otopilot_kademeli_hareket, 0.0, 0.3)
     ap.latest_scan_ranges = orijinal_scan
 
-    gecti = ("HAREKET ENGELLENDİ" in sonuc) or ("🛑" in sonuc)
+    gecti = "HAREKET ENGELLENDİ" in sonuc and "Lidar verisi hiç alınmadı" in sonuc
     sonuc_yaz("1b-Lidar_verisi_yok", gecti, sonuc.splitlines()[0])
 except Exception as e:
     ap.latest_scan_ranges = orijinal_scan
@@ -112,7 +117,7 @@ try:
     sonuc = _cagir(ap.otopilot_kademeli_hareket, 0.0, 0.3)
     ap.son_odom_guncelleme = orijinal_odom_zaman
 
-    gecti = ("HAREKET ENGELLENDİ" in sonuc) or ("🛑" in sonuc)
+    gecti = "HAREKET ENGELLENDİ" in sonuc and "Odometri verisi" in sonuc and "bayat" in sonuc
     sonuc_yaz("1c-Odometri_bayat", gecti, sonuc.splitlines()[0])
 except Exception as e:
     ap.son_odom_guncelleme = orijinal_odom_zaman
@@ -170,9 +175,11 @@ ILERI_MESAFE = float(os.environ.get("CARS_TEST_ILERI_MESAFE", "3.0"))
 
 try:
     sonuc = _cagir(ap.otopilot_kademeli_hareket, 0.0, ILERI_MESAFE)
-    if "CANLI ENGEL TESPİTİ" in sonuc or "LİMİT" in sonuc:
-        sonuc_yaz("3-Ileri_engel", True, "Güvenlik mekanizması devreye girdi (engel algılandı veya limite takıldı).")
-    elif "başarıyla tamamlandı" in sonuc:
+    if "CANLI ENGEL TESPİTİ" in sonuc:
+        sonuc_yaz("3-Ileri_engel", True, "Hareket sırasında engel algılandı ve robot durduruldu.")
+    elif "LİMİT" in sonuc:
+        sonuc_yaz("3-Ileri_engel", None, "Komut sınırlandı; engel algılama doğrulanamadı.")
+    elif motion_completed(sonuc, "İlerleme"):
         sonuc_yaz("3-Ileri_engel", None, f"{ILERI_MESAFE}m boyunca hiç engel yok — bu yönde test edilemedi, alan açık.")
     else:
         sonuc_yaz("3-Ileri_engel", False, f"Beklenmeyen rapor formatı: {sonuc[:150]}")
@@ -191,8 +198,8 @@ try:
     sonuc = _cagir(ap.otopilot_kademeli_hareket, 0.0, GERI_MESAFE)
     if "CANLI ENGEL TESPİTİ" in sonuc:
         sonuc_yaz("4-Geri_engel", True, "Arkada engel doğru şekilde tespit edilip hareket durduruldu.")
-    elif "başarıyla tamamlandı" in sonuc:
-        sonuc_yaz("4-Geri_engel", True, "Arka boş, geri hareket güvenle tamamlandı.")
+    elif motion_completed(sonuc, "İlerleme"):
+        sonuc_yaz("4-Geri_engel", None, "Geri hareket tamamlandı; arkada engel bulunmadığından engel algılama doğrulanamadı.")
     else:
         sonuc_yaz("4-Geri_engel", False, f"Beklenmeyen rapor formatı: {sonuc[:150]}")
 except Exception as e:
@@ -207,12 +214,12 @@ baslik("TEST 5: Normal Koşulda Başarılı Hareket ve Gerçek Mesafe Raporu")
 try:
     # Önce küçük bir dönüş (limitin altında, hızlıca tamamlanmalı)
     sonuc_donus = _cagir(ap.otopilot_kademeli_hareket, 10.0, 0.0)
-    donus_ok = "başarıyla tamamlandı" in sonuc_donus and "Gerçekleşen" in sonuc_donus
+    donus_ok = motion_completed(sonuc_donus, "Dönüş")
 
     # Küçük, güvenli bir ileri hareket. Engel nedeniyle erken durmak güvenli
     # davranıştır ama "normal hareket başarıyla tamamlandı" kanıtı değildir.
     sonuc_mesafe = _cagir(ap.otopilot_kademeli_hareket, 0.0, 0.2)
-    mesafe_ok = "başarıyla tamamlandı" in sonuc_mesafe and "Gerçekleşen" in sonuc_mesafe
+    mesafe_ok = motion_completed(sonuc_mesafe, "İlerleme")
 
     sonuc_yaz("5a-Basarili_donus", donus_ok, sonuc_donus.splitlines()[1] if donus_ok else sonuc_donus[:150])
     if "CANLI ENGEL TESPİTİ" in sonuc_mesafe:
@@ -235,4 +242,7 @@ print(f"✅ Başarılı : {len(BASARILI)}  {BASARILI}")
 print(f"⚠️  Atlanan  : {len(ATLANAN)}  {ATLANAN}")
 print(f"❌ Başarısız: {len(BASARISIZ)}  {BASARISIZ}")
 
-sys.exit(1 if BASARISIZ else 0)
+ozet = summarize(SONUCLAR)
+write_event(dict(ozet, event="test_summary"), RUN_ID)
+print(f"Sonuç: {ozet['status']} | run-id: {RUN_ID}")
+sys.exit(ozet['exit_code'])

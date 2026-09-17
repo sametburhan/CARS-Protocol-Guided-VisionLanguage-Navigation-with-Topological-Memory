@@ -1,3 +1,4 @@
+from experiment_log import logged_tool
 from fastmcp import FastMCP
 import json
 import os
@@ -6,9 +7,6 @@ import time
 import json
 
 _BU_DOSYANIN_KONUMU = os.path.dirname(os.path.abspath(__file__))
-LOG_KLASORU = os.path.normpath(os.path.join(_BU_DOSYANIN_KONUMU, "..", "logs"))
-os.makedirs(LOG_KLASORU, exist_ok=True)
-RUN_MARKER_DOSYASI = os.path.join(LOG_KLASORU, "current_run.txt")
 mcp = FastMCP("Kognitif_Bellek_Merkezi")
 
 BASE_DIR = os.path.normpath(os.path.join(_BU_DOSYANIN_KONUMU, "..", "memory"))
@@ -35,12 +33,12 @@ if not os.path.exists(STM_FILE):
 def ensure_files_exist():
     """Her işlemden önce klasör ve dosyaların var olduğunu garanti eder."""
     os.makedirs(BASE_DIR, exist_ok=True)
-    
+
     if not os.path.exists(LTM_FILE):
         with open(LTM_FILE, "w", encoding="utf-8") as f:
             json.dump({
-                "ltm_topolojik_iskelet": [], 
-                "dag_icerik_agaci": {}       
+                "ltm_topolojik_iskelet": [],
+                "dag_icerik_agaci": {}
             }, f, indent=4)
 
     if not os.path.exists(STM_FILE):
@@ -57,48 +55,19 @@ def save_json(file_path, data):
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
 
-def _run_log_dosyasini_al():
-    """
-    Tüm MCP sunucularının (otopilot, kamera, lidar, kartograf, bellek) AYNI
-    deney/oturum log dosyasına yazmasını sağlar. İlk açılan sunucu bir run ID
-    oluşturur ve marker dosyasına yazar; sonrakiler bunu okuyup kullanır.
-    """
-    if os.path.exists(RUN_MARKER_DOSYASI):
-        with open(RUN_MARKER_DOSYASI, "r") as f:
-            run_id = f.read().strip()
-    else:
-        run_id = time.strftime('%Y%m%d_%H%M%S')
-        with open(RUN_MARKER_DOSYASI, "w") as f:
-            f.write(run_id)
-    return os.path.join(LOG_KLASORU, f"run_{run_id}.jsonl")
 
-RUN_LOG_DOSYASI = _run_log_dosyasini_al()
-
-def _log_yaz(sunucu_adi, tool_adi, girdi: dict, cikti_ozet, sure_saniye: float = None):
-    try:
-        kayit = {
-            "zaman": time.strftime('%Y-%m-%d %H:%M:%S'),
-            "sunucu": sunucu_adi,
-            "tool": tool_adi,
-            "girdi": girdi,
-            "cikti_ozet": (cikti_ozet[:300] if isinstance(cikti_ozet, str) else str(cikti_ozet)),
-            "sure_s": round(sure_saniye, 3) if sure_saniye is not None else None,
-        }
-        with open(RUN_LOG_DOSYASI, "a", encoding="utf-8") as f:
-            f.write(json.dumps(kayit, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"⚠️ Log yazılamadı: {e}")
 # ==========================================
 # 🧠 YENİ LTM: İSKELET VE İÇERİK (AĞAÇ) ARACI
 # ==========================================
 @mcp.tool()
+@logged_tool("Kognitif_Bellek_Merkezi")
 def ltm_kalici_kayit_yap(
     aktif_milestone_adi: str, baglanacagi_eski_milestone: str, gecis_iliskisi: str,
     obje_adi: str, obje_x: float, obje_y: float, robot_x: float, robot_y: float,
     robot_yaw: float, iliskili_obje: str, iliski_tanimi: str, ozellikler: str
 ) -> str:
     """
-    3 Katmanlı Hafıza Kaydı. 
+    3 Katmanlı Hafıza Kaydı.
     1. Yeni bir oda/milestone keşfedildiyse 'aktif_milestone_adi' ve 'baglanacagi_eski_milestone' girilir.
     2. Sadece obje eklenecekse, 'baglanacagi_eski_milestone' ve 'gecis_iliskisi' için 'Yok' girilir.
     3. Sadece milestone oluşturulup obje eklenmeyecekse, 'obje_adi' için 'Yok' girilir.
@@ -109,7 +78,7 @@ def ltm_kalici_kayit_yap(
 
     ltm = load_json(LTM_FILE)
     rapor = []
-    
+
     # --- KATMAN 2: TOPOLOJİK İSKELET (Yol/Bağlantı Kaydı) ---
     if baglanacagi_eski_milestone.lower() != "yok":
         baglanti = {
@@ -144,14 +113,14 @@ def ltm_kalici_kayit_yap(
 
     save_json(LTM_FILE, ltm)
     sonuc = " | ".join(rapor)
-    _log_yaz("Kognitif_Bellek_Merkezi", "ltm_kalici_kayit_yap", girdi, sonuc, time.time() - baslangic)
     return sonuc
 
 @mcp.tool()
+@logged_tool("Kognitif_Bellek_Merkezi")
 def ltm_oku() -> str:
     """Robotun LTM iskeletini ve İçerik Ağacını okuması için kullanılır."""
     ltm = load_json(LTM_FILE)
-    
+
     # LLM matematik halüsinasyonu görmesin diye X, Y ve Yaw verilerini filtreliyoruz (Kognitif Gizleme)
     if "dag_icerik_agaci" in ltm:
         for oda_adi, icerik in ltm["dag_icerik_agaci"].items():
@@ -166,13 +135,14 @@ def ltm_oku() -> str:
                     # YENİ: Gözlem pozu koordinatlarını LLM'den gizle
                     if "gozlem_pozu" in detaylar:
                         detaylar["gozlem_pozu"] = "KOORDİNATLAR GİZLENDİ"
-                    
+
     return json.dumps(ltm, indent=2, ensure_ascii=False)
 
 # ==========================================
 # ⚡ SHORT TERM MEMORY (STM) ARAÇLARI
 # ==========================================
 @mcp.tool()
+@logged_tool("Kognitif_Bellek_Merkezi")
 def stm_anlik_durum_guncelle(son_aksiyon: str, delta_sonuc: str, lokal_durum: str, niyet: str) -> str:
     """
     HER ATOMİK ADIMDA BURAYI GÜNCELLE. (Geçmişi siler, sadece anlık durumu yazar).
@@ -181,7 +151,7 @@ def stm_anlik_durum_guncelle(son_aksiyon: str, delta_sonuc: str, lokal_durum: st
     """
     baslangic = time.time()
     from datetime import datetime
-    
+
     # Liste (append) yerine doğrudan tek bir sözlük (dict) oluşturuyoruz.
     # Bu sayede her çağrıldığında eskisinin üzerine yazacak (Sliding Window).
     stm = {
@@ -198,15 +168,16 @@ def stm_anlik_durum_guncelle(son_aksiyon: str, delta_sonuc: str, lokal_durum: st
     gecmis = gecmis[-4:]  # SADECE son 4 kayıt tutulur
     save_json(STM_FILE, gecmis)
     sonuc = "STM güncellendi. Son 4 adımlık geçmiş korunuyor."
-    _log_yaz("Kognitif_Bellek_Merkezi", "stm_anlik_durum_guncelle", {"niyet": niyet}, sonuc, time.time() - baslangic)
     return sonuc
-    
+
 @mcp.tool()
+@logged_tool("Kognitif_Bellek_Merkezi")
 def stm_oku() -> str:
     """Son 4 adımlık kısa süreli bellek geçmişini (en yeni en sonda) döndürür."""
     return json.dumps(load_json(STM_FILE), indent=2, ensure_ascii=False)
 
 @mcp.tool()
+@logged_tool("Kognitif_Bellek_Merkezi")
 def gecit_otesi_gozlem_kaydet(gecit_adi: str, obje_adi: str, tahmini_ozellikler: str) -> str:
     """
     Bir kapı/geçidin ÖTESİNDE, henüz fiziksel olarak girilmemiş bir odada
@@ -228,7 +199,6 @@ def gecit_otesi_gozlem_kaydet(gecit_adi: str, obje_adi: str, tahmini_ozellikler:
     })
     save_json(LTM_FILE, ltm)
     sonuc = f"📌 Ön keşif notu kaydedildi: '{obje_adi}', '{gecit_adi}' geçidinin ötesinde görülüyor."
-    _log_yaz("Kognitif_Bellek_Merkezi", "gecit_otesi_gozlem_kaydet", {"gecit_adi": gecit_adi, "obje_adi": obje_adi}, sonuc, time.time() - baslangic)
     return sonuc
 
 if __name__ == "__main__":

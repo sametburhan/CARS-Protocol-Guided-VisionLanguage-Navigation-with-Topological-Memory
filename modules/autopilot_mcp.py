@@ -1,3 +1,4 @@
+from experiment_log import logged_tool
 from fastmcp import FastMCP
 import roslibpy
 import time
@@ -30,42 +31,8 @@ MAX_SURE_MESAFE_SANIYE = 25.0
 
 # 🆕 Log dosyası (her oturum/deney için tek dosya)
 _BU_DOSYANIN_KONUMU = os.path.dirname(os.path.abspath(__file__))
-LOG_KLASORU = os.path.normpath(os.path.join(_BU_DOSYANIN_KONUMU, "..", "logs"))
 LTM_FILE = os.path.normpath(os.path.join(_BU_DOSYANIN_KONUMU, "..", "memory", "long_term_memory.json"))
-os.makedirs(LOG_KLASORU, exist_ok=True)
-RUN_MARKER_DOSYASI = os.path.join(LOG_KLASORU, "current_run.txt")
 
-def _run_log_dosyasini_al():
-    """
-    Tüm MCP sunucularının (otopilot, kamera, lidar, kartograf, bellek) AYNI
-    deney/oturum log dosyasına yazmasını sağlar. İlk açılan sunucu bir run ID
-    oluşturur ve marker dosyasına yazar; sonrakiler bunu okuyup kullanır.
-    """
-    if os.path.exists(RUN_MARKER_DOSYASI):
-        with open(RUN_MARKER_DOSYASI, "r") as f:
-            run_id = f.read().strip()
-    else:
-        run_id = time.strftime('%Y%m%d_%H%M%S')
-        with open(RUN_MARKER_DOSYASI, "w") as f:
-            f.write(run_id)
-    return os.path.join(LOG_KLASORU, f"run_{run_id}.jsonl")
-
-RUN_LOG_DOSYASI = _run_log_dosyasini_al()
-
-def _log_yaz(sunucu_adi, tool_adi, girdi: dict, cikti_ozet, sure_saniye: float = None):
-    try:
-        kayit = {
-            "zaman": time.strftime('%Y-%m-%d %H:%M:%S'),
-            "sunucu": sunucu_adi,
-            "tool": tool_adi,
-            "girdi": girdi,
-            "cikti_ozet": (cikti_ozet[:300] if isinstance(cikti_ozet, str) else str(cikti_ozet)),
-            "sure_s": round(sure_saniye, 3) if sure_saniye is not None else None,
-        }
-        with open(RUN_LOG_DOSYASI, "a", encoding="utf-8") as f:
-            f.write(json.dumps(kayit, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"⚠️ Log yazılamadı: {e}")
 
 # ==========================================
 # 🛑 YARDIMCI FONKSİYONLAR
@@ -199,6 +166,7 @@ except Exception as e:
 # 🛠️ CLAUDE İÇİN MCP ARAÇLARI
 # ==========================================
 @mcp.tool()
+@logged_tool("Otopilot_Merkezi")
 def hedef_objeye_yonelme_hesapla(oda_adi: str, obje_adi: str) -> str:
     """
     LTM'de kayıtlı bir objenin (senin mevcut konumuna göre) TAHMİNİ olarak hangi yönde 
@@ -246,6 +214,7 @@ def hedef_objeye_yonelme_hesapla(oda_adi: str, obje_adi: str) -> str:
     )
 
 @mcp.tool()
+@logged_tool("Otopilot_Merkezi")
 def anlik_robot_konumu_al() -> str:
     """
     Robotun ortamdaki GERÇEK global koordinatlarını (x, y, yaw) döndürür.
@@ -255,6 +224,7 @@ def anlik_robot_konumu_al() -> str:
     return f"Gerçek Konum -> X: {current_pose['x']:.2f}, Y: {current_pose['y']:.2f}, Yaw: {current_pose['yaw']:.2f} derece"
 
 @mcp.tool()
+@logged_tool("Otopilot_Merkezi")
 def gecmis_gozlem_noktasina_yonel(oda_adi: str, obje_adi: str) -> str:
     """
     Bir obje LTM'de kayıtlı konumunda bulunamadığında, o objenin İLK GÖZLEMLENDİĞİ
@@ -293,6 +263,7 @@ def gecmis_gozlem_noktasina_yonel(oda_adi: str, obje_adi: str) -> str:
     )
 
 @mcp.tool()
+@logged_tool("Otopilot_Merkezi")
 def kognitif_hedef_analizi(lidar_sari_aci: float, tahmini_mesafe_metre: float) -> str:
     """
     LLM'in Lidar'da tespit ettiği bir hedefin veya boşluğun doğrulaması için kullanılır.
@@ -324,6 +295,7 @@ def kognitif_hedef_analizi(lidar_sari_aci: float, tahmini_mesafe_metre: float) -
     return rapor
 
 @mcp.tool()
+@logged_tool("Otopilot_Merkezi")
 def guvenli_bolge_tarama() -> str:
     """
     Aracın etrafındaki 360 derecelik 20 cm (0.2 metre) yarıçaplı güvenlik çemberini tarar.
@@ -357,6 +329,7 @@ def guvenli_bolge_tarama() -> str:
     return rapor
 
 @mcp.tool()
+@logged_tool("Otopilot_Merkezi")
 def lazer_mesafe_olc(hedef_aci: float) -> str:
     """
     Belirtilen tahmini açının etrafındaki (+/- 15 derece) 30 derecelik geniş bir koniyi tarar.
@@ -414,6 +387,7 @@ def lazer_mesafe_olc(hedef_aci: float) -> str:
             f"(Not: Otopilotu yönlendirirken Lazerin bulduğu '{kesin_aci:.1f}°' açısını kullan.)")
 
 @mcp.tool()
+@logged_tool("Otopilot_Merkezi")
 def kognitif_rota_planla(baslangic_milestone: str, hedef_milestone: str) -> str:
     """
     Robot farklı bir odadaki/bölgedeki hedefe gitmek istediğinde, aradaki duvarlara çarpmaması 
@@ -473,6 +447,7 @@ def kognitif_rota_planla(baslangic_milestone: str, hedef_milestone: str) -> str:
     return "HATA: Bu iki nokta arasında bilinen (keşfedilmiş) bir yol bulunamadı."
 
 @mcp.tool()
+@logged_tool("Otopilot_Merkezi")
 def otopilot_kademeli_hareket(hedef_aci_derece: float, hedef_mesafe_metre: float) -> str:
     """
     Robotu hareket ettiren ANA otopilot aracıdır.
@@ -491,7 +466,6 @@ def otopilot_kademeli_hareket(hedef_aci_derece: float, hedef_mesafe_metre: float
     # 🛑 ÖN GÜVENLİK KONTROLÜ
     izinli, hata_mesaji = _hareket_on_guvenlik_kontrolu()
     if not izinli:
-        _log_yaz("Otopilot_Merkezi", "otopilot_kademeli_hareket", girdi_ozet, hata_mesaji, time.time() - cagri_baslangic)
         return hata_mesaji
 
     uygulanacak_aci = min(abs(hedef_aci_derece), MAX_DONUS)
@@ -539,7 +513,6 @@ def otopilot_kademeli_hareket(hedef_aci_derece: float, hedef_mesafe_metre: float
 
     if sensor_kaybi:
         rapor = f"🛑 SENSÖR/BAĞLANTI KAYBI: Dönüş sırasında {hata_mesaji} Motor durduruldu.\n"
-        _log_yaz("Otopilot_Merkezi", "otopilot_kademeli_hareket", girdi_ozet, rapor, time.time() - cagri_baslangic)
         return rapor
 
     gercek_donus = aciyi_normalize_et(current_pose['yaw'] - baslangic_yaw)
@@ -635,7 +608,6 @@ def otopilot_kademeli_hareket(hedef_aci_derece: float, hedef_mesafe_metre: float
 
     rapor += "\n[ZORUNLU TALİMAT]: Şu an güvendesin ve duruyorsun. KESİNLİKLE Aşama 5'i uygulayarak STM'yi güncelle. Ardından Aşama 2'ye dönüp yeni açından kamerayı ve radarı kontrol et. Çevre temizse otopilotu kalan değerlerle tekrar çağır."
 
-    _log_yaz("Otopilot_Merkezi", "otopilot_kademeli_hareket", girdi_ozet, rapor, time.time() - cagri_baslangic)
     return rapor
 
 

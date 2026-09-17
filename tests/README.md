@@ -55,6 +55,33 @@ PYTHONPATH="$PWD/modules" python3 tests/test_dayaniklilik.py
 
 Eğer spawn noktan tamamen açık bir alansa, Test 3 `ATLANDI` (⚠️) döner — bu bir hata değil, yalnızca o yönde engel davranışının doğrulanamadığı anlamına gelir. Benzer şekilde Test 5'te başlangıç yönünde engel bulunursa güvenli duruş gözlenir fakat normal hareket testi `ATLANDI` sayılır. Daha güvenilir entegrasyon testleri için robotu bilinen ve sabit başlangıç pozlarına yerleştir.
 
-## Çıktı
+## Çıktı ve run-id
 
-Script sonunda ✅/⚠️/❌ sayılarıyla bir özet basar ve en az bir ❌ varsa exit code `1` ile biter. Yalnızca `ATLANDI` sonuçlarının bulunması exit code'u başarısız yapmaz; dolayısıyla `run_tests.sh` bu durumda "TÜM TESTLER BAŞARILI" yazabilir. Bu ifade, tüm senaryoların kanıtlandığı anlamına gelmez. `ATLANDI` sonuçları deney raporunda ayrıca belirtilmelidir.
+Her Python harness çalışması yeni bir run-id oluşturur ve ekrana basar.
+Beş MCP sunucusu yeni çağrılarda aynı aktif run-id'yi kullanır.
+`logs/run_<id>.jsonl` içinde araç başlangıç/bitişleri, `test_result`
+satırları ve sayıları içeren `test_summary` bulunur.
+
+| Çıkış kodu | Anlamı |
+|---|---|
+| 0 | Tüm testler geçti; atlanan yok |
+| 1 | En az bir test başarısız |
+| 2 | Kurulum/import hatası |
+| 3 | Başarısız yok ancak atlanan var; doğrulama eksik |
+
+Başarısız sonuçlar atlananlara göre önceliklidir. Shell başlatıcısı bu kodu
+aynen döndürür; atlanan testlerde artık “TÜM TESTLER BAŞARILI” yazmaz.
+İleri komutun limite takılması ve engelsiz geri hareket, engel algılama
+kanıtı sayılmaz; ilgili engel testi atlanır. İlerleme ve dönüş başarıları
+raporun kendi satırlarından ayrı değerlendirilir.
+
+## ROS olmadan regresyon testleri
+
+```bash
+python3 -m unittest discover -s tests -p test_experiment_log.py -v
+```
+
+Bu testler geçici log/bellek dizinleri kullanır; ROS'u sahteleştirir ve
+hareket komutu yayınlamaz. Gerçek FastMCP istemcisi üzerinden 18 aracın kayıt
+kapsamını, çok süreçli sıra numaralarını, run değişimini, istisna kaydını ve
+özet sınıflandırmasını denetler. Canlı Gazebo hareket testlerinin yerine geçmez.
