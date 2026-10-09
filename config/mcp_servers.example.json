@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "autopilot": {
+      "command": "wsl.exe",
+      "args": ["-d", "Ubuntu", "--cd", "/home/name/ros2_ws", "--exec", "python3", "modules/autopilot_mcp.py"]
+    },
+    "camera": {
+      "command": "wsl.exe",
+      "args": ["-d", "Ubuntu", "--cd", "/home/name/ros2_ws", "--exec", "python3", "modules/camera_mcp.py"]
+    },
+    "lidar_radar": {
+      "command": "wsl.exe",
+      "args": ["-d", "Ubuntu", "--cd", "/home/name/ros2_ws", "--exec", "python3", "modules/lidar_mcp.py"]
+    },
+    "cartographer": {
+      "command": "wsl.exe",
+      "args": ["-d", "Ubuntu", "--cd", "/home/name/ros2_ws", "--exec", "python3", "modules/cartographer_mcp.py"]
+    },
+    "cognitive_memory": {
+      "command": "wsl.exe",
+      "args": ["-d", "Ubuntu", "--cd", "/home/name/ros2_ws", "--exec", "python3", "modules/custom_memory_mcp.py"]
+    }
+  }
+}

@@ -4,7 +4,7 @@
 def motion_completed(report, component):
     # A successful zero-degree turn must not hide a failed translation.
     return any(line.startswith(f'- {component}:') and
-               'başarıyla tamamlandı' in line and 'Gerçekleşen' in line
+               "completed successfully" in line and "Measured" in line
                for line in report.splitlines())
 
 

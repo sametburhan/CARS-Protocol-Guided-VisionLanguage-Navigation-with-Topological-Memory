@@ -1,87 +1,93 @@
-# 🧪 CARS Dayanıklılık Testleri
+# CARS Tests
 
-Bu paket, izole birim testlerinden oluşmaz. Gerçek ROS 2/Gazebo yığınına bağlanan ve bazı durumları kontrollü hata enjeksiyonuyla oluşturan bir **entegrasyon/dayanıklılık test harness'idir**. Sonuçlar; başlangıç pozu, sensör verisinin tazeliği ve simülasyon dünyasındaki engellere bağlı olabilir.
+## Live durability harness
 
-## Ne test ediyor?
+This is an integration harness connected to ROS 2/Gazebo, with controlled fault
+injection for selected conditions. Results depend on spawn pose, sensor freshness,
+and the active world's obstacles. It is not an isolated unit-test suite.
 
-| # | Senaryo | Yöntem | Ortama bağımlı mı? |
-|---|---|---|---|
-| 1 | Sensör/ROS kaybı | `ros_client`, `latest_scan_ranges`, `son_odom_guncelleme` geçici olarak sahteleştirilir | ⚠️ Kısmen — hata enjeksiyonu kontrollü, ancak bazı alt testler çalışan ROS tabanını gerektirir |
-| 2 | Timeout (dönüş+mesafe) | `MAX_SURE_DONUS_SANIYE`/`MAX_SURE_MESAFE_SANIYE` geçici olarak 0.05s'e çekilir | ✅ Evet — canlı ve taze sensör verisi ile hareketin engellenmemesi gerekir |
-| 3 | İleri engel | Robotun baktığı yönde büyük bir mesafe istenir, güvenlik mekanizmasının tepkisi yorumlanır | ✅ Evet — Gazebo dünyana bağlı |
-| 4 | Geri hareket | Küçük bir geri hareket istenir | ✅ Evet — Gazebo dünyana bağlı |
-| 5 | Başarılı hareket | Küçük, güvenli bir dönüş + ilerleme | ✅ Evet — başlangıç yönü ve sensör durumuna bağlı |
+| Scenario | Method | Environment dependence |
+| --- | --- | --- |
+| Sensor/ROS loss | Temporarily replace connection, scan, or odometry timestamp | Some cases require a working ROS baseline |
+| Turn/move timeout | Temporarily reduce timeouts to 0.05 seconds | Requires fresh sensors and unblocked motion |
+| Forward obstacle | Request a longer forward move and inspect the safety result | Depends on obstacle placement |
+| Rear obstacle | Request a short reverse move | Depends on rear obstacles |
+| Successful motion | Small turn and forward move | Requires a clear route and fresh sensors |
 
-## Test edilebilir timeout sınırları
-
-Test 2, `modules/autopilot_mcp.py` içindeki aşağıdaki modül sabitlerini test süresince geçici olarak küçültür:
+The harness imports Autopilot directly and does not use MCP transport. Keep
+these constants at module scope so tests can temporarily override them:
 
 ```python
-MAX_DONUS = 60.0
-MAX_MESAFE = 3.5
-GUVENLIK_DURMA_ESIGI_ON = 0.25
-GUVENLIK_CEVRE_SINIRI = 0.20
-MAX_SURE_DONUS_SANIYE = 10.0
-MAX_SURE_MESAFE_SANIYE = 25.0
+MAX_TURN_DEGREES = 60.0
+MAX_DISTANCE_METERS = 3.5
+FRONT_STOP_THRESHOLD_METERS = 0.25
+SAFETY_RADIUS_METERS = 0.20
+MAX_TURN_DURATION_SECONDS = 10.0
+MAX_MOVE_DURATION_SECONDS = 25.0
 ```
 
-Üretim değerleri test sonunda geri yüklenir. Bu sabitler fonksiyon içine taşınırsa timeout testi çalışmaz ve `ATLANDI` olarak raporlanır. Süre sınırlarının küçültülmesi kontrollüdür; buna rağmen hareket daha önce bir sensör veya engel kontrolüyle kesilirse test beklenen timeout sonucunu üretemez.
+Production values are restored after the timeout cases. A sensor or obstacle
+stop before the timeout does not verify the expected timeout behavior.
 
-## Çalıştırma
+Launch the simulation and tests from the repository root:
 
 ```bash
-cd /path/to/ros2_ws
 ./tests/run_tests.sh
 ```
 
-Bağımsız olarak (Gazebo zaten çalışıyorsa) sadece Python testlerini de çalıştırabilirsin:
+If Gazebo and rosbridge are already running:
 
 ```bash
-cd /path/to/ros2_ws
-PYTHONPATH="$PWD/modules" python3 tests/test_dayaniklilik.py
+PYTHONPATH="$PWD/modules" python3 tests/test_durability.py
 ```
 
-Test harness'i `modules/` yolunu kendisi de `sys.path` içine ekler; yukarıdaki `PYTHONPATH` kullanımı çalıştırma ortamını açık ve yeniden üretilebilir tutmak için gösterilmiştir.
-
-## Ortam değişkenleriyle ayarlama
-
-Test 3/4, senin Gazebo dünyandaki (`turtlebot3_house`) gerçek engel konumlarını bilmediğimiz için **best-effort** çalışır — kesin PASS/FAIL yerine sonucu yorumlar:
+The harness also adds `modules/` to its import path. Forward/reverse test distances
+can be configured with English environment variable names:
 
 ```bash
-cd /path/to/ros2_ws
-CARS_TEST_ILERI_MESAFE=5.0 CARS_TEST_GERI_MESAFE=-1.0 \
-PYTHONPATH="$PWD/modules" python3 tests/test_dayaniklilik.py
+CARS_TEST_FORWARD_DISTANCE=3.5 CARS_TEST_REVERSE_DISTANCE=-1.0 \
+PYTHONPATH="$PWD/modules" python3 tests/test_durability.py
 ```
 
-Eğer spawn noktan tamamen açık bir alansa, Test 3 `ATLANDI` (⚠️) döner — bu bir hata değil, yalnızca o yönde engel davranışının doğrulanamadığı anlamına gelir. Benzer şekilde Test 5'te başlangıç yönünde engel bulunursa güvenli duruş gözlenir fakat normal hareket testi `ATLANDI` sayılır. Daha güvenilir entegrasyon testleri için robotu bilinen ve sabit başlangıç pozlarına yerleştir.
+An open forward route or obstacle-free reverse move skips obstacle verification;
+it does not pass it. A safety stop in the normal-motion case likewise does not
+prove successful unobstructed motion. Use controlled, repeatable spawn positions
+for reliable integration evidence. Turn and translation success are classified
+from their separate result lines.
 
-## Çıktı ve run-id
+Every run creates a fresh experiment ID. Tools share the active run; the JSONL
+contains tool start/end events, individual `test_result` records, and a counted
+`test_summary`. Failures take precedence over skips, and the shell launcher
+returns the harness status unchanged:
 
-Her Python harness çalışması yeni bir run-id oluşturur ve ekrana basar.
-Beş MCP sunucusu yeni çağrılarda aynı aktif run-id'yi kullanır.
-`logs/run_<id>.jsonl` içinde araç başlangıç/bitişleri, `test_result`
-satırları ve sayıları içeren `test_summary` bulunur.
+| Exit code | Meaning |
+| --- | --- |
+| 0 | All cases passed; none skipped |
+| 1 | At least one failure |
+| 2 | Setup/import error |
+| 3 | No failures, but skipped cases or no results; incomplete verification |
 
-| Çıkış kodu | Anlamı |
-|---|---|
-| 0 | Tüm testler geçti; atlanan yok |
-| 1 | En az bir test başarısız |
-| 2 | Kurulum/import hatası |
-| 3 | Başarısız yok ancak atlanan var; doğrulama eksik |
-
-Başarısız sonuçlar atlananlara göre önceliklidir. Shell başlatıcısı bu kodu
-aynen döndürür; atlanan testlerde artık “TÜM TESTLER BAŞARILI” yazmaz.
-İleri komutun limite takılması ve engelsiz geri hareket, engel algılama
-kanıtı sayılmaz; ilgili engel testi atlanır. İlerleme ve dönüş başarıları
-raporun kendi satırlarından ayrı değerlendirilir.
-
-## ROS olmadan regresyon testleri
+## Offline regression suite
 
 ```bash
 python3 -m unittest discover -s tests -p test_experiment_log.py -v
 ```
 
-Bu testler geçici log/bellek dizinleri kullanır; ROS'u sahteleştirir ve
-hareket komutu yayınlamaz. Gerçek FastMCP istemcisi üzerinden 18 aracın kayıt
-kapsamını, çok süreçli sıra numaralarını, run değişimini, istisna kaydını ve
-özet sınıflandırmasını denetler. Canlı Gazebo hareket testlerinin yerine geçmez.
+The logging suite uses disposable log/memory directories and fake ROS while
+exercising real FastMCP registration and transport. It verifies all 20 tools,
+the camera-to-memory-to-map workflow, process-safe sequence numbers, run rotation,
+exception recording, image summaries, and result classification. It also
+verifies detailed-camera JPEG delivery over MCP, resizing, malformed-frame
+errors, and exclusion of image pixels from logs.
+
+These checks do not replace the live Gazebo motion tests. Do not use unrestricted
+`unittest discover` with the live harness pattern: importing `test_durability.py`
+starts a live run. Select the offline filenames explicitly as above.
+
+
+## Model telemetry regressions
+
+Run `python3 -m unittest discover -s tests -p test_model_metrics.py -v` without
+ROS or API credentials. These tests cover timing, usage validation, missing
+values, retries/errors, run rotation, stage markers, byte/character accounting,
+and the importer/report CLI. See `METRICS.md` for measurement boundaries.

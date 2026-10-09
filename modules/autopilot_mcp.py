@@ -6,50 +6,48 @@ import math
 import os
 import json
 
-mcp = FastMCP("Otopilot_Merkezi")
+mcp = FastMCP("Autopilot")
 
-# Global değişkenler
+# Global state
 ros_client = None
 latest_scan_ranges = None
 cmd_vel_pub = None
 front_distance = 3.5
 current_pose = {"x": 0.0, "y": 0.0, "yaw": 0.0}
 
-# 🆕 Sensör tazelik takibi
-son_lidar_guncelleme = None
-son_odom_guncelleme = None
-MAX_SENSOR_YAS_SANIYE = 1.0  # bu süreden eski veri "donmuş" sayılır
+# Sensor freshness tracking
+last_lidar_update = None
+last_odom_update = None
+MAX_SENSOR_AGE_SECONDS = 1.0  # Older readings are considered stale.
 
-# Hareket sınırları modül düzeyindedir. Üretim davranışı değişmeden kalır;
-# dayanıklılık testleri bu değerleri geçici olarak küçültebilir.
-MAX_DONUS = 60.0
-MAX_MESAFE = 3.5
-GUVENLIK_DURMA_ESIGI_ON = 0.25
-GUVENLIK_CEVRE_SINIRI = 0.20
-MAX_SURE_DONUS_SANIYE = 10.0
-MAX_SURE_MESAFE_SANIYE = 25.0
+# Motion limits are module constants; production values remain unchanged.
+# Durability tests can temporarily reduce these values.
+MAX_TURN_DEGREES = 60.0
+MAX_DISTANCE_METERS = 3.5
+FRONT_STOP_THRESHOLD_METERS = 0.25
+SAFETY_RADIUS_METERS = 0.20
+MAX_TURN_DURATION_SECONDS = 10.0
+MAX_MOVE_DURATION_SECONDS = 25.0
 
-# 🆕 Log dosyası (her oturum/deney için tek dosya)
-_BU_DOSYANIN_KONUMU = os.path.dirname(os.path.abspath(__file__))
-LTM_FILE = os.path.normpath(os.path.join(_BU_DOSYANIN_KONUMU, "..", "memory", "long_term_memory.json"))
+# Shared long-term memory file
+MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+LTM_FILE = os.path.normpath(os.path.join(MODULE_DIR, "..", "memory", "long_term_memory.json"))
 
 
 # ==========================================
-# 🛑 YARDIMCI FONKSİYONLAR
+# HELPER FUNCTIONS
 # ==========================================
-def araci_durdur():
+def stop_robot():
     global cmd_vel_pub
     if cmd_vel_pub is not None:
         msg = roslibpy.Message({'linear': {'x': 0.0, 'y': 0.0, 'z': 0.0}, 'angular': {'x': 0.0, 'y': 0.0, 'z': 0.0}})
         cmd_vel_pub.publish(msg)
 
-def _guvenli_bolge_kontrolu(sinir=0.20):
-    """
-    360° yarıçapında engel var mı diye dahili kontrol.
-    guvenli_bolge_tarama tool'u VE otopilot hareket döngüsü bu fonksiyonu paylaşır
-    (kod tekrarını önlemek ve tutarlılığı garantilemek için).
-    Döndürür: (engel_var: bool, tehlikeli_engeller: list)
-    """
+def _check_safety_zone(radius=0.20):
+    """Check for obstacles within the full 360-degree safety radius.
+
+    Shared by scan_safety_zone and the motion loop to keep checks consistent.
+    Returns (obstacle_detected: bool, nearby_obstacles: list)."""
     global latest_scan_ranges
     if latest_scan_ranges is None:
         return False, []
@@ -57,56 +55,54 @@ def _guvenli_bolge_kontrolu(sinir=0.20):
     if num_beams == 0:
         return False, []
 
-    tehlikeli_engeller = []
+    nearby_obstacles = []
     for idx, r in enumerate(latest_scan_ranges):
-        if r is not None and 0.05 < r < sinir:
-            aci_derece = (idx / num_beams) * 360.0
-            lokal_aci = aci_derece - 360.0 if aci_derece > 180 else aci_derece
-            tehlikeli_engeller.append({"aci": lokal_aci, "mesafe": r})
+        if r is not None and 0.05 < r < radius:
+            angle_degrees = (idx / num_beams) * 360.0
+            local_angle = angle_degrees - 360.0 if angle_degrees > 180 else angle_degrees
+            nearby_obstacles.append({"angle": local_angle, "distance": r})
 
-    return (len(tehlikeli_engeller) > 0), tehlikeli_engeller
+    return (len(nearby_obstacles) > 0), nearby_obstacles
 
-def _hareket_on_guvenlik_kontrolu():
-    """
-    Fiziksel harekete izin verilip verilmeyeceğini kontrol eder:
-    ROS bağlantısı, sensör verisinin VARLIĞI ve TAZELİĞİ.
-    Döndürür: (izinli: bool, hata_mesaji: str)
-    """
-    global ros_client, latest_scan_ranges, son_lidar_guncelleme, son_odom_guncelleme
+def _check_motion_preconditions():
+    """Check ROS connectivity and the presence and freshness of sensor data.
+
+    Returns (allowed: bool, error_message: str)."""
+    global ros_client, latest_scan_ranges, last_lidar_update, last_odom_update
 
     if ros_client is None or not ros_client.is_connected:
-        return False, "🛑 HAREKET ENGELLENDİ: ROS bağlantısı yok. Motor komutu gönderilmedi."
+        return False, "MOTION BLOCKED: No ROS connection. No motor command was sent."
 
     if latest_scan_ranges is None:
-        return False, "🛑 HAREKET ENGELLENDİ: Lidar verisi hiç alınmadı. Güvenlik nedeniyle hareket iptal edildi."
+        return False, "MOTION BLOCKED: No Lidar data has been received. Motion canceled for safety."
 
-    if son_odom_guncelleme is None:
-        return False, "🛑 HAREKET ENGELLENDİ: Odometri verisi hiç alınmadı. Konum bilinmiyor, hareket iptal edildi."
+    if last_odom_update is None:
+        return False, "MOTION BLOCKED: No odometry data has been received. Pose unknown; motion canceled."
 
-    simdi = time.time()
-    if (simdi - son_lidar_guncelleme) > MAX_SENSOR_YAS_SANIYE:
-        return False, f"🛑 HAREKET ENGELLENDİ: Lidar verisi {simdi - son_lidar_guncelleme:.1f}s önce donmuş (bayat). Hareket iptal edildi."
+    now = time.time()
+    if (now - last_lidar_update) > MAX_SENSOR_AGE_SECONDS:
+        return False, f"MOTION BLOCKED: Lidar data is {now - last_lidar_update:.1f}s old (stale). Motion canceled."
 
-    if (simdi - son_odom_guncelleme) > MAX_SENSOR_YAS_SANIYE:
-        return False, f"🛑 HAREKET ENGELLENDİ: Odometri verisi {simdi - son_odom_guncelleme:.1f}s önce donmuş (bayat). Hareket iptal edildi."
+    if (now - last_odom_update) > MAX_SENSOR_AGE_SECONDS:
+        return False, f"MOTION BLOCKED: Odometry data is {now - last_odom_update:.1f}s old (stale). Motion canceled."
 
     return True, ""
 
-def aciyi_normalize_et(aci):
-    """Açıyı her zaman -180 ile 180 derece arasına hapseder."""
-    while aci > 180.0:
-        aci -= 360.0
-    while aci < -180.0:
-        aci += 360.0
-    return aci
+def normalize_angle(angle):
+    """Normalize an angle to the range -180 to 180 degrees."""
+    while angle > 180.0:
+        angle -= 360.0
+    while angle < -180.0:
+        angle += 360.0
+    return angle
 
 # ==========================================
-# 🌉 ROS 2 BAĞLANTILARI (Lidar ve Odom)
+# ROS 2 CONNECTIONS (Lidar and odometry)
 # ==========================================
 def lidar_callback(message):
-    global front_distance, latest_scan_ranges, son_lidar_guncelleme
+    global front_distance, latest_scan_ranges, last_lidar_update
     if 'ranges' in message:
-        son_lidar_guncelleme = time.time()  # 🆕
+        last_lidar_update = time.time()  # Record the sensor update time.
         ranges = message['ranges']
         latest_scan_ranges = message['ranges']
         num_beams = len(ranges)
@@ -129,8 +125,8 @@ def lidar_callback(message):
             front_distance = 3.5
 
 def odom_callback(message):
-    """Robotun Gazebo'daki gerçek konumunu ve açısını okur"""
-    global current_pose, son_odom_guncelleme
+    """Read the robot position and heading from Gazebo odometry."""
+    global current_pose, last_odom_update
     try:
         pos = message['pose']['pose']['position']
         ori = message['pose']['pose']['orientation']
@@ -142,7 +138,7 @@ def odom_callback(message):
         yaw_rad = math.atan2(siny_cosp, cosy_cosp)
         current_pose["yaw"] = math.degrees(yaw_rad)
 
-        son_odom_guncelleme = time.time()  # 🆕 — sadece başarılı parse'ta güncellenir
+        last_odom_update = time.time()  # Update only after successful parsing.
     except KeyError:
         pass
 
@@ -158,417 +154,553 @@ try:
     odom_topic = roslibpy.Topic(ros_client, '/odom', 'nav_msgs/Odometry')
     odom_topic.subscribe(odom_callback)
     
-    print("✅ Otopilot MCP Sunucusu: /cmd_vel, /scan ve /odom aktif.")
+    print("Autopilot MCP server: /cmd_vel, /scan and /odom are active.")
 except Exception as e:
-    print(f"❌ ROS Bağlantı Hatası: {e}")
+    print(f"ROS connection error: {e}")
 
 # ==========================================
-# 🛠️ CLAUDE İÇİN MCP ARAÇLARI
+# MCP TOOLS FOR THE AGENT
 # ==========================================
 @mcp.tool()
-@logged_tool("Otopilot_Merkezi")
-def hedef_objeye_yonelme_hesapla(oda_adi: str, obje_adi: str) -> str:
-    """
-    LTM'de kayıtlı bir objenin (senin mevcut konumuna göre) TAHMİNİ olarak hangi yönde 
-    ve ne kadar uzakta olduğunu hesaplayan Kognitif Pusula aracıdır.
-    Otopilota göndermen gereken dönüş açısını doğrudan verir.
-    """
+@logged_tool("Autopilot")
+def calculate_object_heading(room_name: str, object_name: str) -> str:
+    """Calculate the estimated direction and distance to an object stored in LTM.
+
+    Returns the turn angle to send to move_robot, relative to the current pose.
+    Use only for an object in the current room; plan a route first otherwise."""
     import os, json
     
     if not os.path.exists(LTM_FILE):
-        return "HATA: LTM dosyası bulunamadı."
+        return "ERROR: LTM file not found."
         
     with open(LTM_FILE, "r", encoding="utf-8") as f:
         ltm = json.load(f)
         
     try:
-        obje_veri = ltm["dag_icerik_agaci"][oda_adi]["objeler"][obje_adi]
-        hedef_x = obje_veri["x"]
-        hedef_y = obje_veri["y"]
+        object_data = ltm["content_tree"][room_name]["objects"][object_name]
+        target_x = object_data["x"]
+        target_y = object_data["y"]
     except KeyError:
-        return f"HATA: '{oda_adi}' içinde '{obje_adi}' isimli obje bulunamadı."
+        return f"ERROR: Object '{object_name}' was not found in '{room_name}'."
         
     global current_pose
-    dx = hedef_x - current_pose['x']
-    dy = hedef_y - current_pose['y']
+    dx = target_x - current_pose['x']
+    dy = target_y - current_pose['y']
     
-    mesafe = math.sqrt(dx**2 + dy**2)
-    global_hedef_aci_rad = math.atan2(dy, dx)
-    global_hedef_aci_deg = math.degrees(global_hedef_aci_rad)
+    distance = math.sqrt(dx**2 + dy**2)
+    global_target_angle_rad = math.atan2(dy, dx)
+    global_target_angle_deg = math.degrees(global_target_angle_rad)
     
-    # Lokal açı hesabı
-    fark_deg = global_hedef_aci_deg - current_pose['yaw']
+    # Calculate the local angle.
+    difference_deg = global_target_angle_deg - current_pose['yaw']
     
-    # Açıyı -180 ile 180 arasına normalize et
-    while fark_deg > 180.0: fark_deg -= 360.0
-    while fark_deg < -180.0: fark_deg += 360.0
+    # Normalize the angle to the range -180 to 180 degrees.
+    while difference_deg > 180.0: difference_deg -= 360.0
+    while difference_deg < -180.0: difference_deg += 360.0
     
-    yon_str = "SOL" if fark_deg > 0 else "SAĞ"
+    direction_label = "LEFT" if difference_deg > 0 else "RIGHT"
     
     return (
-        f"📍 KOGNİTİF PUSULA SONUCU:\n"
-        f"- Hedef: {obje_adi} ({oda_adi})\n"
-        f"- Tahmini Mesafe: {mesafe:.2f} metre\n"
-        f"- Yön: Sana göre {yon_str} tarafta.\n"
-        f"KULLANIM TALİMATI: Otopilotu çağırırken donus_acisi_derece parametresi olarak {fark_deg:.1f} kullanın."
+        f"COGNITIVE COMPASS RESULT:\n"
+        f"- Target: {object_name} ({room_name})\n"
+        f"- Estimated distance: {distance:.2f} meters\n"
+        f"- Direction: To your {direction_label}.\n"
+        f"USAGE: Call move_robot with target_angle_degrees={difference_deg:.1f}."
     )
 
 @mcp.tool()
-@logged_tool("Otopilot_Merkezi")
-def anlik_robot_konumu_al() -> str:
-    """
-    Robotun ortamdaki GERÇEK global koordinatlarını (x, y, yaw) döndürür.
-    Özellikle LTM'ye (Uzun Süreli Bellek) yeni bir oda, obje veya doğum noktası kaydederken
-    ezbere değerler girmek yerine kendi gerçek konumunu öğrenmek için bu aracı çağır.
-    """
-    return f"Gerçek Konum -> X: {current_pose['x']:.2f}, Y: {current_pose['y']:.2f}, Yaw: {current_pose['yaw']:.2f} derece"
+@logged_tool("Autopilot")
+def get_robot_pose() -> str:
+    """Return the current global robot pose (x, y, yaw in degrees).
+
+    Use this tool before recording a room, object observation, or starting point
+    in LTM instead of inventing coordinates."""
+    return f"Current pose -> X: {current_pose['x']:.2f}, Y: {current_pose['y']:.2f}, Yaw: {current_pose['yaw']:.2f} degrees"
 
 @mcp.tool()
-@logged_tool("Otopilot_Merkezi")
-def gecmis_gozlem_noktasina_yonel(oda_adi: str, obje_adi: str) -> str:
-    """
-    Bir obje LTM'de kayıtlı konumunda bulunamadığında, o objenin İLK GÖZLEMLENDİĞİ
-    noktaya (gozlem_pozu) dönmek için otopilot açısı/mesafesi hesaplar.
-    Ham koordinat döndürmez, sadece hareket komutu verir.
-    """
+@logged_tool("Autopilot")
+def calculate_observation_heading(room_name: str, object_name: str) -> str:
+    """Calculate the heading and distance to an object's recorded observation pose.
+
+    Use when the object cannot be found at its stored location. Returns motion
+    guidance rather than raw coordinates. Plan a route first if in another room."""
     import os, json
 
     if not os.path.exists(LTM_FILE):
-        return "HATA: LTM dosyası bulunamadı."
+        return "ERROR: LTM file not found."
 
     with open(LTM_FILE, "r", encoding="utf-8") as f:
         ltm = json.load(f)
 
     try:
-        hedef = ltm["dag_icerik_agaci"][oda_adi]["objeler"][obje_adi]["gozlem_pozu"]
+        target = ltm["content_tree"][room_name]["objects"][object_name]["observation_pose"]
     except KeyError:
-        return f"HATA: '{oda_adi}' içinde '{obje_adi}' için gözlem pozu bulunamadı."
+        return f"ERROR: No observation pose was found for '{object_name}' in '{room_name}'."
 
     global current_pose
-    dx = hedef["x"] - current_pose['x']
-    dy = hedef["y"] - current_pose['y']
+    dx = target["x"] - current_pose['x']
+    dy = target["y"] - current_pose['y']
 
-    mesafe = math.sqrt(dx**2 + dy**2)
-    global_hedef_aci_deg = math.degrees(math.atan2(dy, dx))
+    distance = math.sqrt(dx**2 + dy**2)
+    global_target_angle_deg = math.degrees(math.atan2(dy, dx))
 
-    # current_pose['yaw'] zaten DERECE cinsinden — ikinci kez math.degrees() UYGULANMAZ
-    fark_deg = global_hedef_aci_deg - current_pose['yaw']
-    fark_deg = aciyi_normalize_et(fark_deg)  # dosyada zaten var olan yardımcıyı kullan
+    # current_pose['yaw'] is already in degrees; do not convert it a second time.
+    difference_deg = global_target_angle_deg - current_pose['yaw']
+    difference_deg = normalize_angle(difference_deg)  # Use the shared angle normalization helper.
 
     return (
-        f"📍 GEÇMİŞ GÖZLEM NOKTASI PUSULASI:\n"
-        f"- Hedef: '{obje_adi}' objesinin ilk görüldüğü nokta ({oda_adi})\n"
-        f"- Tahmini Mesafe: {mesafe:.2f} metre\n"
-        f"KULLANIM TALİMATI: Otopilotu çağırırken hedef_aci_derece parametresi olarak {fark_deg:.1f} kullanın."
+        f"PREVIOUS OBSERVATION COMPASS:\n"
+        f"- Target: The recorded observation point for '{object_name}' ({room_name})\n"
+        f"- Estimated distance: {distance:.2f} meters\n"
+        f"USAGE: Call move_robot with target_angle_degrees={difference_deg:.1f}."
     )
 
 @mcp.tool()
-@logged_tool("Otopilot_Merkezi")
-def kognitif_hedef_analizi(lidar_sari_aci: float, tahmini_mesafe_metre: float) -> str:
-    """
-    LLM'in Lidar'da tespit ettiği bir hedefin veya boşluğun doğrulaması için kullanılır.
-    Lidar'dan okunan sarı açıyı (0-360) alır, otopilot için GÜVENLİ dönüş komutunu hesaplar.
-    Ayrıca objenin LTM'ye kaydedilmesi için kesin Global (X, Y) koordinatlarını çıkartır.
-    """
+@logged_tool("Autopilot")
+def analyze_target(lidar_angle_degrees: float, estimated_distance_meters: float) -> str:
+    """Convert a target's yellow Lidar angle (0-360) to a signed autopilot turn.
+
+    Also estimate global X/Y coordinates for LTM using the supplied measured
+    distance. These coordinates are sensor-based estimates, not ground truth."""
     global current_pose
     
-    if lidar_sari_aci > 180:
-        donus_komutu = lidar_sari_aci - 360.0
+    if lidar_angle_degrees > 180:
+        turn_command = lidar_angle_degrees - 360.0
     else:
-        donus_komutu = lidar_sari_aci
+        turn_command = lidar_angle_degrees
         
     yaw_rad = math.radians(current_pose['yaw'])
-    delta_rad = math.radians(donus_komutu)
-    mutlak_aci_rad = yaw_rad + delta_rad
+    delta_rad = math.radians(turn_command)
+    absolute_angle_rad = yaw_rad + delta_rad
     
-    hedef_x = current_pose['x'] + (tahmini_mesafe_metre * math.cos(mutlak_aci_rad))
-    hedef_y = current_pose['y'] + (tahmini_mesafe_metre * math.sin(mutlak_aci_rad))
+    target_x = current_pose['x'] + (estimated_distance_meters * math.cos(absolute_angle_rad))
+    target_y = current_pose['y'] + (estimated_distance_meters * math.sin(absolute_angle_rad))
     
-    rapor = (
-        f"✅ Hipotez Doğrulandı ve Hesaplandı:\n"
-        f"- Otopilot Dönüş Komutu: {donus_komutu:.1f}°\n"
-        f"- Tahmini Global Koordinat (LTM için) -> X: {hedef_x:.2f}, Y: {hedef_y:.2f}\n"
-        f"[UYARI]: Bu koordinatlar KESİN değildir, sensör tabanlı tahmindir. "
-        f"LTM'ye kayıt yapılacaksa bu bilgiyi 'ozellikler' alanına not et.\n"
-        f"KULLANIM: Otopilotu çağırırken donus_acisi_derece parametresi için {donus_komutu:.1f} kullanın."
+    report = (
+        f"TARGET ANALYSIS COMPLETE:\n"
+        f"- Autopilot turn command: {turn_command:.1f} degrees\n"
+        f"- Estimated global coordinates (for LTM) -> X: {target_x:.2f}, Y: {target_y:.2f}\n"
+        f"[WARNING]: These coordinates are sensor-based estimates, not exact values. "
+        f"Record this uncertainty in the LTM 'properties' field.\n"
+        f"USAGE: Call move_robot with target_angle_degrees={turn_command:.1f}."
     )
-    return rapor
+    return report
 
 @mcp.tool()
-@logged_tool("Otopilot_Merkezi")
-def guvenli_bolge_tarama() -> str:
-    """
-    Aracın etrafındaki 360 derecelik 20 cm (0.2 metre) yarıçaplı güvenlik çemberini tarar.
-    Hareket etmeden önce veya hedefe giderken yol üstünde ani bir engel olup olmadığını
-    kontrol etmek için kullanılır.
-    """
+@logged_tool("Autopilot")
+def scan_safety_zone() -> str:
+    """Scan a 360-degree safety zone with a radius of 20 cm (0.2 meters).
+
+    Check for nearby obstacles before motion and during approach planning."""
     global latest_scan_ranges
     if latest_scan_ranges is None:
-        return "⚠️ HATA: Lidar (Radar) verisi okunamıyor."
+        return "ERROR: Lidar (radar) data is unavailable."
 
-    engel_var, tehlikeli_engeller = _guvenli_bolge_kontrolu(sinir=0.20)
+    obstacle_detected, nearby_obstacles = _check_safety_zone(radius=0.20)
 
-    if not engel_var:
-        return "✅ GÜVENLİ BÖLGE TEMİZ: 20 cm çapında hiçbir engel tespit edilmedi. Güzergah açık."
+    if not obstacle_detected:
+        return "SAFETY ZONE CLEAR: No obstacles detected within a 20 cm radius. Route clear."
 
-    rapor = "🚨 GÜVENLİK UYARISI: Yakın Çevrede Engeller Tespit Edildi!\n\n"
-    for engel in tehlikeli_engeller:
-        aci = engel["aci"]
-        mesafe_cm = engel["mesafe"] * 100
-        if -30 <= aci <= 30:
-            yon = "ÖN BÖLGE (İleri güzergahı kapatıyor)"
-        elif 30 < aci <= 150:
-            yon = f"SOL BÖLGE (Açı: +{aci:.1f}°)"
-        elif -150 <= aci < -30:
-            yon = f"SAĞ BÖLGE (Açı: {aci:.1f}°)"
+    report = "SAFETY WARNING: Nearby obstacles detected!\n\n"
+    for obstacle in nearby_obstacles:
+        angle = obstacle["angle"]
+        distance_cm = obstacle["distance"] * 100
+        if -30 <= angle <= 30:
+            direction = "FRONT (blocking the forward route)"
+        elif 30 < angle <= 150:
+            direction = f"LEFT (angle: +{angle:.1f} degrees)"
+        elif -150 <= angle < -30:
+            direction = f"RIGHT (angle: {angle:.1f} degrees)"
         else:
-            yon = "ARKA BÖLGE"
-        rapor += f"- Konum: {yon} | Uzaklık: {mesafe_cm:.1f} cm\n"
+            direction = "REAR"
+        report += f"- Position: {direction} | Distance: {distance_cm:.1f} cm\n"
 
-    rapor += "\n[MANEVRA TALİMATI]: Eğer bu engeller hedefe gidiş yönündeyse, doğrudan ilerleme! Çarpmamak için Otopilot ile engelin TERSİ yönüne en az 30 derece dönüp, 0.3 metre ilerleyerek etrafından dolan (Waypoint oluştur)."
-    return rapor
+    report += "\n[MANEUVER]: If these obstacles block the target direction, do not drive straight ahead. Turn at least 30 degrees away from the obstacle and advance 0.3 meters along a verified safe waypoint to bypass it."
+    return report
+
+def _near_cluster_angular_width(
+    scan,
+    target_idx,
+    num_beams,
+    hit_distance,
+    tolerance=0.08,
+    max_window_deg=20,
+):
+    """Calculate the angular width occupied by beams near hit_distance.
+
+    Beams within ±tolerance meters of hit_distance are counted inside a
+    ±max_window_deg search window centered on target_idx.
+    """
+    if num_beams <= 0:
+        return 0.0
+
+    window_idx = int(max_window_deg / 360.0 * num_beams)
+    consistent_beams = 0
+
+    for offset in range(-window_idx, window_idx + 1):
+        idx = (target_idx + offset) % num_beams
+        distance = scan[idx]
+
+        if (
+            distance is not None
+            and math.isfinite(distance)
+            and abs(distance - hit_distance) <= tolerance
+        ):
+            consistent_beams += 1
+
+    return consistent_beams * (360.0 / num_beams)
+
+
+def _narrow_cluster_note(cluster_width_deg):
+    """Return an objective structural note for a narrow Lidar cluster."""
+    if cluster_width_deg is None or cluster_width_deg >= 6.0:
+        return ""
+
+    return (
+        "\n"
+        f"Note: This distance reading spans a narrow angular cluster of only "
+        f"{cluster_width_deg:.1f} degrees. Structurally, this profile matches "
+        f"a thin obstacle (e.g., pole or furniture leg) rather than a wide "
+        f"object surface."
+        "\n\n[SYSTEM REMINDER]: Structurally, this profile matches a thin "
+        "obstacle. Please review **Section 6 (Occlusion prohibitions)** and "
+        "**Section 3: Final target verification** to ensure you are not aiming "
+        "at a foreground obstacle."
+    )
+
+
+def _near_distance_disagreement_reminder(distance_meters):
+    """Prompt visual/Lidar reconciliation only for a very near reading."""
+    if distance_meters >= 0.5:
+        return ""
+
+    return (
+        "\n\n[SYSTEM REMINDER]: If this near distance contradicts your clear "
+        "visual evidence, review **Section 3: Spatial awareness synthesis "
+        "(Disagreement & Ghost Object Exception)** to resolve the conflict."
+    )
+
 
 @mcp.tool()
-@logged_tool("Otopilot_Merkezi")
-def lazer_mesafe_olc(hedef_aci: float) -> str:
-    """
-    Belirtilen tahmini açının etrafındaki (+/- 15 derece) 30 derecelik geniş bir koniyi tarar.
-    Bu koni içindeki EN YAKIN engelin/objenin milimetrik mesafesini ve KESİN açısını bulur.
-    Ajanın radar görselinden mesafe tahmin etmesi yasaktır; daima bu aracı kullanmalıdır.
+@logged_tool("Autopilot")
+def measure_laser_distance(target_angle: float) -> str:
+    """Measure the nearest obstacle in a 30-degree cone around target_angle.
+
+    Returns its measured distance and angle. It also measures the angular
+    width of nearby Lidar beams at approximately the same distance. A narrow
+    cluster is reported as an objective structural observation.
+
+    Use this tool instead of estimating distance from the radar image.
+    The forward shortcut uses front_distance.
     """
     global latest_scan_ranges, front_distance
 
-    # OPTİMİZASYON: Hedef açı zaten öne çok yakınsa (kamera ile 0°'ye hizalanmış),
-    # lidar_callback'in sürekli güncellediği front_distance'ı tekrar hesaplamadan kullan.
-    if abs(hedef_aci) <= 2.0:
-        if front_distance >= 3.5:
-            return "Hedef açı (0°): +/- 15° koni içinde bir engel tespit edilemedi. Yol tamamen açık (front_distance)."
-        return (f"✅ Lazer Ölçümü Başarılı (canlı front_distance)!\n"
-                f"- Senin Tahminin: {hedef_aci}°\n"
-                f"- Kesin Açı: 0.0° (ön)\n"
-                f"- Objenin Kesin Uzaklığı: {front_distance:.2f} metre\n"
-                f"(Not: Otopilotu yönlendirirken '0.0°' açısını kullan.)")
+    # Take local snapshots so one invocation uses a consistent set of values
+    # even if the ROS callback replaces the global scan during processing.
+    scan = latest_scan_ranges
+    live_front_distance = front_distance
 
-    if latest_scan_ranges is None:
-        return "⚠️ HATA: Lidar (Radar) verisi okunamıyor."
+    # For a target already aligned with the camera center, preserve the
+    # existing front_distance shortcut.
+    if abs(target_angle) <= 2.0:
+        if live_front_distance >= 3.5:
+            return (
+                "Target angle (0 degrees): No obstacle detected in the "
+                "+/-15-degree cone. Route clear (front_distance)."
+            )
 
-    num_beams = len(latest_scan_ranges)
+        cluster_width_deg = None
+
+        # Locate the beam which produced front_distance so the cluster is
+        # measured around the actual hit rather than around beam zero.
+        if scan:
+            num_beams = len(scan)
+            beams_to_check = int(15.0 / 360.0 * num_beams)
+
+            front_indices = list(range(0, beams_to_check))
+            front_indices.extend(
+                range(num_beams - beams_to_check, num_beams)
+            )
+
+            valid_front_indices = [
+                idx
+                for idx in front_indices
+                if (
+                    scan[idx] is not None
+                    and math.isfinite(scan[idx])
+                    and scan[idx] > 0.15
+                )
+            ]
+
+            if valid_front_indices:
+                measured_idx = min(
+                    valid_front_indices,
+                    key=lambda idx: abs(scan[idx] - live_front_distance),
+                )
+
+                cluster_width_deg = _near_cluster_angular_width(
+                    scan=scan,
+                    target_idx=measured_idx,
+                    num_beams=num_beams,
+                    hit_distance=live_front_distance,
+                )
+
+        report = (
+            "LASER MEASUREMENT SUCCESSFUL (live front_distance)!\n"
+            f"- Estimated angle: {target_angle} degrees\n"
+            "- Measured angle: 0.0 degrees (front, corresponds to 0.0 degrees on the 360-degree radar map)\n"
+            f"- Measured object distance: {live_front_distance:.2f} meters\n"
+            "(Use 0.0 degrees when directing the autopilot.)"
+        )
+
+        report += _near_distance_disagreement_reminder(live_front_distance)
+        return report + _narrow_cluster_note(cluster_width_deg)
+
+    if scan is None:
+        return "ERROR: Lidar (radar) data is unavailable."
+
+    num_beams = len(scan)
     if num_beams == 0:
-        return "⚠️ HATA: Lidar verisi boş."
+        return "ERROR: Lidar data is empty."
 
-    if hedef_aci < 0:
-        hedef_aci_normalize = 360.0 + hedef_aci
-    else:
-        hedef_aci_normalize = hedef_aci
+    normalized_target_angle = target_angle % 360.0
+    target_idx = int(normalized_target_angle / 360.0 * num_beams)
 
-    target_idx = int((hedef_aci_normalize % 360) / 360.0 * num_beams)
     window_deg = 15
     window_idx = int(window_deg / 360.0 * num_beams)
 
-    gercek_mesafe = float('inf')
-    kesin_aci = hedef_aci
+    measured_distance = float("inf")
+    measured_idx = None
+    precise_angle = target_angle
 
-    for i in range(-window_idx, window_idx + 1):
-        idx = (target_idx + i) % num_beams
-        r = latest_scan_ranges[idx]
-        if r is not None and 0.1 < r < 12.0:
-            if r < gercek_mesafe:
-                gercek_mesafe = r
-                hesaplanan_aci = (idx / num_beams) * 360.0
-                kesin_aci = hesaplanan_aci - 360.0 if hesaplanan_aci > 180 else hesaplanan_aci
+    for offset in range(-window_idx, window_idx + 1):
+        idx = (target_idx + offset) % num_beams
+        distance = scan[idx]
 
-    if gercek_mesafe == float('inf'):
-        return f"Hedef açı ({hedef_aci}°): Tarama konisi (+/- {window_deg}°) içinde bir engel tespit edilemedi. Yol tamamen açık."
+        if (
+            distance is not None
+            and math.isfinite(distance)
+            and 0.1 < distance < 12.0
+            and distance < measured_distance
+        ):
+            measured_distance = distance
+            measured_idx = idx
 
-    return (f"✅ Lazer Ölçümü Başarılı!\n"
-            f"- Senin Tahminin: {hedef_aci}°\n"
-            f"- Lazerin Bulduğu Kesin Açı: {kesin_aci:.1f}°\n"
-            f"- Objenin Kesin Uzaklığı: {gercek_mesafe:.2f} metre\n"
-            f"(Not: Otopilotu yönlendirirken Lazerin bulduğu '{kesin_aci:.1f}°' açısını kullan.)")
+            computed_angle = idx / num_beams * 360.0
+            precise_angle = (
+                computed_angle - 360.0
+                if computed_angle > 180.0
+                else computed_angle
+            )
+
+    if measured_idx is None:
+        return (
+            f"Target angle ({target_angle} degrees): No obstacle detected "
+            f"in the +/-{window_deg}-degree cone. Route clear."
+        )
+
+    cluster_width_deg = _near_cluster_angular_width(
+        scan=scan,
+        target_idx=measured_idx,
+        num_beams=num_beams,
+        hit_distance=measured_distance,
+    )
+
+    radar_angle = (precise_angle + 360.0) % 360.0
+    
+    report = (
+        "LASER MEASUREMENT SUCCESSFUL!\n"
+        f"- Estimated angle: {target_angle} degrees\n"
+        f"- Measured angle: {precise_angle:.1f} degrees (corresponds to {radar_angle:.1f} degrees on the 360-degree radar map)\n"
+        f"- Measured object distance: {measured_distance:.2f} meters\n"
+        f"(Use the signed measured angle of {precise_angle:.1f} degrees when "
+        "directing the autopilot.)"
+    )
+
+    report += _near_distance_disagreement_reminder(measured_distance)
+    return report + _narrow_cluster_note(cluster_width_deg)
 
 @mcp.tool()
-@logged_tool("Otopilot_Merkezi")
-def kognitif_rota_planla(baslangic_milestone: str, hedef_milestone: str) -> str:
-    """
-    Robot farklı bir odadaki/bölgedeki hedefe gitmek istediğinde, aradaki duvarlara çarpmaması 
-    için hangi odalardan ve kapılardan geçmesi gerektiğini (Adım Adım Rota) hesaplar.
-    LTM'deki topolojik iskeleti kullanarak en kısa yolu (BFS algoritması ile) bulur.
-    """
+@logged_tool("Autopilot")
+def plan_topological_route(start_milestone: str, target_milestone: str) -> str:
+    """Find a shortest room-and-passage route using the LTM topology and BFS.
+
+    Follow these milestones before approaching an object in another room,
+    rather than using a direct heading that might cross a wall."""
     import os, json
     from collections import deque
     
     if not os.path.exists(LTM_FILE):
-        return "HATA: LTM dosyası bulunamadı."
+        return "ERROR: LTM file not found."
         
     with open(LTM_FILE, "r", encoding="utf-8") as f:
         ltm = json.load(f)
         
-    iskelet = ltm.get("ltm_topolojik_iskelet", [])
+    topology = ltm.get("topological_graph", [])
     
-    # Graf oluşturma (Çift yönlü geçiş varsayımı)
-    graf = {}
-    for baglanti in iskelet:
-        k = baglanti["kaynak"]
-        h = baglanti["hedef"]
-        if k not in graf: graf[k] = []
-        if h not in graf: graf[h] = []
-        graf[k].append(h)
-        graf[h].append(k) # Geri dönüş yolunu da ekle
+    # Build a graph assuming bidirectional transitions.
+    graph = {}
+    for connection in topology:
+        k = connection["source"]
+        h = connection["target"]
+        if k not in graph: graph[k] = []
+        if h not in graph: graph[h] = []
+        graph[k].append(h)
+        graph[h].append(k) # Include the return path.
         
-    if baslangic_milestone not in graf or hedef_milestone not in graf:
-        return f"HATA: {baslangic_milestone} veya {hedef_milestone} haritada (LTM İskeletinde) bulunamadı."
+    if start_milestone not in graph or target_milestone not in graph:
+        return f"ERROR: {start_milestone} or {target_milestone} was not found in the LTM topology."
 
-    # BFS (Breadth-First Search) ile En Kısa Yolu Bulma
-    kuyruk = deque([[baslangic_milestone]])
-    ziyaret_edilenler = set([baslangic_milestone])
+    # Find a shortest route using breadth-first search.
+    queue = deque([[start_milestone]])
+    visited = set([start_milestone])
     
-    while kuyruk:
-        yol = kuyruk.popleft()
-        mevcut_dugum = yol[-1]
+    while queue:
+        route = queue.popleft()
+        current_node = route[-1]
         
-        if mevcut_dugum == hedef_milestone:
-            # Rotayı LLM'in anlayacağı insan diline çevir
-            rota_metni = " -> ".join(yol)
-            rapor = (
-                f"🗺️ ROTA PLANI OLUŞTURULDU:\n"
-                f"Nihai hedefine duvarlara çarpmadan ulaşmak için şu sırayı izlemelisin:\n"
-                f"[ROTA]: {rota_metni}\n\n"
-                f"TALİMAT: Kuş uçuşu hedefe yönelmeden önce, sırasıyla bu duraklara (Milestone) git."
+        if current_node == target_milestone:
+            # Format the route as human-readable guidance.
+            route_text = " -> ".join(route)
+            report = (
+                f"ROUTE PLAN CREATED:\n"
+                f"Follow these milestones in order to reach the target through known transitions:\n"
+                f"[ROUTE]: {route_text}\n\n"
+                f"INSTRUCTION: Visit each milestone in order before taking a direct heading to the final target."
             )
-            return rapor
+            return report
             
-        for komsu in graf.get(mevcut_dugum, []):
-            if komsu not in ziyaret_edilenler:
-                ziyaret_edilenler.add(komsu)
-                yeni_yol = list(yol)
-                yeni_yol.append(komsu)
-                kuyruk.append(yeni_yol)
+        for neighbor in graph.get(current_node, []):
+            if neighbor not in visited:
+                visited.add(neighbor)
+                new_route = list(route)
+                new_route.append(neighbor)
+                queue.append(new_route)
                 
-    return "HATA: Bu iki nokta arasında bilinen (keşfedilmiş) bir yol bulunamadı."
+    return "ERROR: No known route was found between these two points."
 
 @mcp.tool()
-@logged_tool("Otopilot_Merkezi")
-def otopilot_kademeli_hareket(hedef_aci_derece: float, hedef_mesafe_metre: float) -> str:
-    """
-    Robotu hareket ettiren ANA otopilot aracıdır.
-    - Maksimum tek seferlik dönüş: 60 derece
-    - Maksimum tek seferlik ilerleme: 3.5 metre (LiDAR max güvenilir görme menzili)
-    - ROS bağlantısı yoksa veya Lidar/Odometri verisi eksik/bayatsa hareket BAŞLAMAZ.
-    - Dönüş ve mesafe döngülerinde timeout vardır (robot fiziksel sıkışırsa sonsuza kalmaz).
-    - Hareket sırasında sensör kaybı olursa motor derhal durur.
-    Mesafe hareketi sırasında SÜREKLİ canlı güvenlik kontrolü yapılır:
-    (1) front_distance ile uzun menzilli ön çarpışma kontrolü,
-    (2) 360° güvenli bölge kontrolü ile yalpalama/açılı çarpışma kontrolü.
-    """
-    cagri_baslangic = time.time()
-    girdi_ozet = {"hedef_aci_derece": hedef_aci_derece, "hedef_mesafe_metre": hedef_mesafe_metre}
+@logged_tool("Autopilot")
+def move_robot(target_angle_degrees: float, target_distance_meters: float) -> str:
+    """Execute a bounded turn followed by a bounded translation.
 
-    # 🛑 ÖN GÜVENLİK KONTROLÜ
-    izinli, hata_mesaji = _hareket_on_guvenlik_kontrolu()
-    if not izinli:
-        return hata_mesaji
+    Maximum turn: 60 degrees. Maximum distance: 3.5 meters per call.
+    Motion requires connected ROS and present, fresh Lidar and odometry data.
+    Both motion loops have timeouts. Sensor loss stops the motors. Translation
+    continuously checks frontal clearance and the full near-field safety zone.
+    Positive angles turn left; negative angles turn right. Negative distance reverses."""
+    call_started = time.time()
 
-    uygulanacak_aci = min(abs(hedef_aci_derece), MAX_DONUS)
-    if hedef_aci_derece < 0:
-        uygulanacak_aci = -uygulanacak_aci
+    target_angle_degrees = normalize_angle(target_angle_degrees)
 
-    uygulanacak_mesafe = min(abs(hedef_mesafe_metre), MAX_MESAFE)
-    if hedef_mesafe_metre < 0:
-        uygulanacak_mesafe = -uygulanacak_mesafe
+    input_summary = {"target_angle_degrees": target_angle_degrees, "target_distance_meters": target_distance_meters}
+
+    # CHECK MOTION PRECONDITIONS
+    allowed, error_message = _check_motion_preconditions()
+    if not allowed:
+        return error_message
+
+    applied_angle = min(abs(target_angle_degrees), MAX_TURN_DEGREES)
+    if target_angle_degrees < 0:
+        applied_angle = -applied_angle
+
+    applied_distance = min(abs(target_distance_meters), MAX_DISTANCE_METERS)
+    if target_distance_meters < 0:
+        applied_distance = -applied_distance
 
     global cmd_vel_pub, current_pose, front_distance
 
-    baslangic_yaw = current_pose['yaw']
-    donus_timeout = False
-    sensor_kaybi = False
+    initial_yaw = current_pose['yaw']
+    turn_timeout = False
+    sensor_lost = False
 
-    if abs(uygulanacak_aci) > 0:
-        hedef_mutlak_yaw = aciyi_normalize_et(current_pose['yaw'] + uygulanacak_aci)
-        tolerans_derece = 1.5
-        donus_baslangic_zaman = time.time()
+    if abs(applied_angle) > 0:
+        target_absolute_yaw = normalize_angle(current_pose['yaw'] + applied_angle)
+        tolerance_degrees = 1.5
+        turn_started = time.time()
         while True:
-            if time.time() - donus_baslangic_zaman > MAX_SURE_DONUS_SANIYE:
-                donus_timeout = True
+            if time.time() - turn_started > MAX_TURN_DURATION_SECONDS:
+                turn_timeout = True
                 break
 
-            izinli, hata_mesaji = _hareket_on_guvenlik_kontrolu()
-            if not izinli:
-                sensor_kaybi = True
+            allowed, error_message = _check_motion_preconditions()
+            if not allowed:
+                sensor_lost = True
                 break
 
-            fark = aciyi_normalize_et(hedef_mutlak_yaw - current_pose['yaw'])
-            if abs(fark) <= tolerans_derece:
+            difference = normalize_angle(target_absolute_yaw - current_pose['yaw'])
+            if abs(difference) <= tolerance_degrees:
                 break
-            angular_speed = 0.4 if fark > 0 else -0.4
-            if abs(fark) < 15.0:
-                angular_speed = 0.15 if fark > 0 else -0.15
+            angular_speed = 0.4 if difference > 0 else -0.4
+            if abs(difference) < 15.0:
+                angular_speed = 0.15 if difference > 0 else -0.15
             twist_msg = roslibpy.Message({
                 'linear': {'x': 0.0, 'y': 0.0, 'z': 0.0},
                 'angular': {'x': 0.0, 'y': 0.0, 'z': angular_speed}
             })
             cmd_vel_pub.publish(twist_msg)
             time.sleep(0.05)
-        araci_durdur()
+        stop_robot()
         time.sleep(0.5)
 
-    if sensor_kaybi:
-        rapor = f"🛑 SENSÖR/BAĞLANTI KAYBI: Dönüş sırasında {hata_mesaji} Motor durduruldu.\n"
-        return rapor
+    if sensor_lost:
+        report = f"SENSOR/CONNECTION LOST: During rotation: {error_message} Motors stopped.\n"
+        return report
 
-    gercek_donus = aciyi_normalize_et(current_pose['yaw'] - baslangic_yaw)
+    measured_turn = normalize_angle(current_pose['yaw'] - initial_yaw)
 
     # ==========================================
-    # 📏 MESAFE KONTROLÜ
+    # DISTANCE CONTROL
     # ==========================================
-    erken_durduruldu = False
-    mesafe_timeout = False
-    sensor_kaybi_mesafede = False
-    gidilen_mesafe = 0.0
+    stopped_early = False
+    move_timeout = False
+    sensor_lost_during_move = False
+    traveled_distance = 0.0
 
-    if abs(uygulanacak_mesafe) > 0:
-        baslangic_x = current_pose['x']
-        baslangic_y = current_pose['y']
-        tolerans_metre = 0.02
-        mesafe_baslangic_zaman = time.time()
+    if abs(applied_distance) > 0:
+        initial_x = current_pose['x']
+        initial_y = current_pose['y']
+        tolerance_meters = 0.02
+        move_started = time.time()
 
         while True:
-            if time.time() - mesafe_baslangic_zaman > MAX_SURE_MESAFE_SANIYE:
-                mesafe_timeout = True
+            if time.time() - move_started > MAX_MOVE_DURATION_SECONDS:
+                move_timeout = True
                 break
 
-            izinli, hata_mesaji = _hareket_on_guvenlik_kontrolu()
-            if not izinli:
-                sensor_kaybi_mesafede = True
+            allowed, error_message = _check_motion_preconditions()
+            if not allowed:
+                sensor_lost_during_move = True
                 break
 
-            gidilen_mesafe = math.sqrt((current_pose['x'] - baslangic_x)**2 + (current_pose['y'] - baslangic_y)**2)
-            kalan_mesafe = abs(uygulanacak_mesafe) - gidilen_mesafe
+            traveled_distance = math.sqrt((current_pose['x'] - initial_x)**2 + (current_pose['y'] - initial_y)**2)
+            remaining_distance = abs(applied_distance) - traveled_distance
 
-            if kalan_mesafe <= tolerans_metre:
+            if remaining_distance <= tolerance_meters:
                 break
 
-            if uygulanacak_mesafe > 0 and front_distance < GUVENLIK_DURMA_ESIGI_ON:
-                erken_durduruldu = True
+            if applied_distance > 0 and front_distance < FRONT_STOP_THRESHOLD_METERS:
+                stopped_early = True
                 break
 
-            engel_var, tehlikeli_engeller = _guvenli_bolge_kontrolu(sinir=GUVENLIK_CEVRE_SINIRI)
-            if engel_var:
-                carpisma_riski = False
-                for engel in tehlikeli_engeller:
-                    aci = engel["aci"]
-                    if uygulanacak_mesafe > 0 and (-90 <= aci <= 90):
-                        carpisma_riski = True
+            obstacle_detected, nearby_obstacles = _check_safety_zone(radius=SAFETY_RADIUS_METERS)
+            if obstacle_detected:
+                collision_risk = False
+                for obstacle in nearby_obstacles:
+                    angle = obstacle["angle"]
+                    if applied_distance > 0 and (-90 <= angle <= 90):
+                        collision_risk = True
                         break
-                    elif uygulanacak_mesafe < 0 and (aci < -90 or aci > 90):
-                        carpisma_riski = True
+                    elif applied_distance < 0 and (angle < -90 or angle > 90):
+                        collision_risk = True
                         break
-                if carpisma_riski:
-                    erken_durduruldu = True
+                if collision_risk:
+                    stopped_early = True
                     break
 
-            linear_speed = 0.2 if uygulanacak_mesafe > 0 else -0.2
-            if kalan_mesafe < 0.15:
-                linear_speed = 0.08 if uygulanacak_mesafe > 0 else -0.08
+            linear_speed = 0.2 if applied_distance > 0 else -0.2
+            if remaining_distance < 0.15:
+                linear_speed = 0.08 if applied_distance > 0 else -0.08
 
             twist_msg = roslibpy.Message({
                 'linear': {'x': linear_speed, 'y': 0.0, 'z': 0.0},
@@ -577,38 +709,56 @@ def otopilot_kademeli_hareket(hedef_aci_derece: float, hedef_mesafe_metre: float
             cmd_vel_pub.publish(twist_msg)
             time.sleep(0.05)
 
-        araci_durdur()
+        stop_robot()
         time.sleep(0.5)
-        gidilen_mesafe = math.sqrt((current_pose['x'] - baslangic_x)**2 + (current_pose['y'] - baslangic_y)**2)
+        traveled_distance = math.sqrt((current_pose['x'] - initial_x)**2 + (current_pose['y'] - initial_y)**2)
 
     # ==========================================
-    # 3. KOGNİTİF GERİ BİLDİRİM
+    # MOTION FEEDBACK
     # ==========================================
-    rapor = "✅ FİZİKSEL HAREKET TAMAMLANDI VE MOTORLAR DURDURULDU.\n"
+    report = "MOTION SEQUENCE FINISHED AND MOTORS STOPPED.\n"
 
-    if abs(hedef_aci_derece) > MAX_DONUS:
-        kalan_aci = hedef_aci_derece - uygulanacak_aci
-        rapor += f"⚠️ DÖNÜŞ LİMİTİ: İstenen {hedef_aci_derece}°, ancak GÜVENLİK için {uygulanacak_aci}° dönüldü. Gerçekleşen: {gercek_donus:.1f}°. (Kalan hedefin: {kalan_aci}°)\n"
-    elif donus_timeout:
-        rapor += f"⏱️ DÖNÜŞ TIMEOUT: {MAX_SURE_DONUS_SANIYE}s içinde hedef açıya ulaşılamadı. Gerçekleşen dönüş: {gercek_donus:.1f}° (istenen: {uygulanacak_aci}°). Robot fiziksel olarak sıkışmış olabilir.\n"
+    if abs(target_angle_degrees) > MAX_TURN_DEGREES:
+        remaining_angle = target_angle_degrees - applied_angle
+        report += f"TURN LIMIT: Requested {target_angle_degrees} degrees; safety limit applied {applied_angle} degrees. Measured: {measured_turn:.1f} degrees. (Remaining: {remaining_angle} degrees)\n"
+    elif turn_timeout:
+        report += f"TURN TIMEOUT: Target angle not reached within {MAX_TURN_DURATION_SECONDS}s. Measured turn: {measured_turn:.1f} degrees (requested: {applied_angle} degrees). The robot may be physically stuck.\n"
     else:
-        rapor += f"- Dönüş: İstenen {hedef_aci_derece}° (Gerçekleşen: {gercek_donus:.1f}°) başarıyla tamamlandı.\n"
+        report += f"- Turn: Requested {target_angle_degrees} degrees (Measured: {measured_turn:.1f} degrees) completed successfully.\n"
 
-    if sensor_kaybi_mesafede:
-        rapor += f"🛑 SENSÖR/BAĞLANTI KAYBI: Mesafe hareketi sırasında sensör/ROS bağlantısı kesildi, motor durduruldu. Gerçekte gidilen: {gidilen_mesafe:.2f}m (istenen: {hedef_mesafe_metre}m).\n"
-    elif mesafe_timeout:
-        rapor += f"⏱️ MESAFE TIMEOUT: {MAX_SURE_MESAFE_SANIYE}s içinde hedef mesafeye ulaşılamadı. Gerçekte gidilen: {gidilen_mesafe:.2f}m (istenen: {hedef_mesafe_metre}m). Robot fiziksel olarak sıkışmış olabilir.\n"
-    elif erken_durduruldu:
-        rapor += f"🚨 CANLI ENGEL TESPİTİ: Yalnızca {gidilen_mesafe:.2f}m gidilebildi, hareket sırasında ani bir engel algılandı ve durduruldu. (Hedef: {hedef_mesafe_metre}m)\n"
-    elif abs(hedef_mesafe_metre) > MAX_MESAFE:
-        kalan_mesafe = hedef_mesafe_metre - uygulanacak_mesafe
-        rapor += f"⚠️ MESAFE LİMİTİ: İstenen {hedef_mesafe_metre}m, ancak GÜVENLİK için {uygulanacak_mesafe}m gidildi. Gerçekte gidilen: {gidilen_mesafe:.2f}m. (Kalan hedefin: {kalan_mesafe}m)\n"
+    if sensor_lost_during_move:
+        report += f"SENSOR/CONNECTION LOST: Sensor/ROS connection lost during translation; motors stopped. Traveled: {traveled_distance:.2f}m (requested: {target_distance_meters}m).\n"
+    elif move_timeout:
+        report += f"DISTANCE TIMEOUT: Target distance not reached within {MAX_MOVE_DURATION_SECONDS}s. Traveled: {traveled_distance:.2f}m (requested: {target_distance_meters}m). The robot may be physically stuck.\n"
+    elif stopped_early:
+        report += f"LIVE OBSTACLE DETECTED: Traveled only {traveled_distance:.2f}m; an obstacle was detected during motion and the robot stopped. (Target: {target_distance_meters}m)\n"
+    elif abs(target_distance_meters) > MAX_DISTANCE_METERS:
+        remaining_distance = target_distance_meters - applied_distance
+        report += f"DISTANCE LIMIT: Requested {target_distance_meters}m; safety limit applied {applied_distance}m. Traveled: {traveled_distance:.2f}m. (Remaining: {remaining_distance}m)\n"
     else:
-        rapor += f"- İlerleme: İstenen {hedef_mesafe_metre}m (Gerçekleşen: {gidilen_mesafe:.2f}m) başarıyla tamamlandı.\n"
+        report += f"- Translation: Requested {target_distance_meters}m (Measured: {traveled_distance:.2f}m) completed successfully.\n"
 
-    rapor += "\n[ZORUNLU TALİMAT]: Şu an güvendesin ve duruyorsun. KESİNLİKLE Aşama 5'i uygulayarak STM'yi güncelle. Ardından Aşama 2'ye dönüp yeni açından kamerayı ve radarı kontrol et. Çevre temizse otopilotu kalan değerlerle tekrar çağır."
+    report += "\n[REQUIRED]: The robot is stopped. Update STM in Stage 5, then return to Stage 2 and inspect the camera and radar from the new pose. If the route is clear, call the autopilot again with the remaining values."
 
-    return rapor
+    if stopped_early:
+        report += (
+            "\n\n[SYSTEM REMINDER]: A live obstacle blocked the path. Do not use "
+            "bash commands or attempt to read code parameters. Please review "
+            "**Section 3: Stage 4** and **Section 3: Spatial awareness "
+            "synthesis** regarding obstacle handling and limits."
+        )
+
+    if (
+        abs(target_angle_degrees) > MAX_TURN_DEGREES
+        or abs(target_distance_meters) > MAX_DISTANCE_METERS
+    ):
+        report += (
+            "\n\n[SYSTEM REMINDER]: A motion safety limit was applied. Please "
+            "review **Section 6, Rule 4** and **Section 3: Stage 4** before "
+            "making your next movement decision."
+        )
+
+    return report
 
 
 if __name__ == "__main__":

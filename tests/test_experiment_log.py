@@ -76,7 +76,11 @@ class TraceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'sensor failure'):
             asyncio.run(failure())
         rows = self.records(current_run())
-        self.assertEqual(rows[1]['girdi'], {'value': 4})
+        self.assertEqual(rows[1]['inputs'], {'value': 4})
+        self.assertEqual(rows[1]['server'], 'test')
+        self.assertTrue(all(row['schema_version'] == 2 and 'timestamp' in row for row in rows))
+        self.assertIn('duration_seconds', rows[2])
+        self.assertIn('output_summary', rows[2])
         self.assertEqual(rows[2]['status'], 'exception')
         self.assertEqual(rows[2]['error']['type'], 'ValueError')
 
@@ -126,7 +130,7 @@ class TraceTests(unittest.TestCase):
                     self.assertEqual(ast.unparse(node.decorator_list[0]), 'mcp.tool()')
                     self.assertEqual(node.decorator_list[1].func.id, 'logged_tool', node.name)
                     total += 1
-        self.assertEqual(total, 18)
+        self.assertEqual(total, 20)
 
     def test_actual_tools_over_mcp_with_fake_ros(self):
         # Real FastMCP registration/transport and real tools; only ROS is fake.
@@ -153,7 +157,7 @@ class TraceTests(unittest.TestCase):
         copied = Path(self.temp.name) / 'runtime/modules'
         shutil.copytree(MODULES, copied)
         modules = {}
-        ros_patch = patch.dict(sys.modules, {'roslibpy': SimpleNamespace(Ros=Ros, Topic=Topic, Message=dict)})
+        ros_patch = patch.multiple('roslibpy', Ros=Ros, Topic=Topic, Message=dict)
         ros_patch.start()
         self.addCleanup(ros_patch.stop)
         for path in copied.glob('*_mcp.py'):
@@ -170,6 +174,9 @@ class TraceTests(unittest.TestCase):
                         properties = tool.inputSchema.get('properties', {})
                         arguments = {name: 0.0 if prop.get('type') in ('number', 'integer') else 'test'
                                      for name, prop in properties.items()}
+                        if tool.name == 'finish_cognitive_stage':
+                            from stage_metrics import start_stage
+                            arguments = {'stage_id': start_stage(0, 'test', 'test'), 'outcome': 'completed'}
                         result = await client.call_tool(tool.name, arguments)
                         self.assertFalse(result.is_error, tool.name)
                         names.append(tool.name)
@@ -179,11 +186,11 @@ class TraceTests(unittest.TestCase):
         rows = self.records(current_run())
         starts = [r for r in rows if r['event'] == 'tool_start']
         ends = [r for r in rows if r['event'] == 'tool_end']
-        self.assertEqual(len(names), 18)
+        self.assertEqual(len(names), 20)
         self.assertEqual([r['tool'] for r in starts], names)
         self.assertEqual([r['call_id'] for r in starts], [r['call_id'] for r in ends])
         self.assertTrue(all(r['status'] == 'returned' for r in ends))
-        self.assertTrue(any('HATA' in str(r['cikti_ozet']) for r in ends))
+        self.assertTrue(any("ERROR" in str(r['output_summary']) for r in ends))
 
         # Exercise the video chain with successful observations and persistence.
         run_id = start_run('critical_chain')
@@ -208,26 +215,26 @@ class TraceTests(unittest.TestCase):
         def fresh_scan(_=None):
             import time
             lidar.latest_scan_ranges = autopilot.latest_scan_ranges = [2.0] * 360
-            lidar.son_lidar_guncelleme = autopilot.son_lidar_guncelleme = time.time()
-            autopilot.son_odom_guncelleme = time.time()
+            lidar.last_lidar_update = autopilot.last_lidar_update = time.time()
+            autopilot.last_odom_update = time.time()
 
         fresh_scan()
         chain = [
-            ('camera_mcp', 'hizli_kamera_al', {}),
-            ('lidar_mcp', 'anlik_lidar_radar_haritasi_al', {}),
-            ('autopilot_mcp', 'lazer_mesafe_olc', {'hedef_aci': 20.0}),
-            ('custom_memory_mcp', 'ltm_kalici_kayit_yap', {
-                'aktif_milestone_adi': 'room', 'baglanacagi_eski_milestone': 'start',
-                'gecis_iliskisi': 'door', 'obje_adi': 'chair', 'obje_x': 2.0, 'obje_y': 0.0,
+            ('camera_mcp', 'get_fast_camera', {}),
+            ('lidar_mcp', 'get_lidar_radar_map', {}),
+            ('autopilot_mcp', 'measure_laser_distance', {'target_angle': 20.0}),
+            ('custom_memory_mcp', 'save_long_term_memory', {
+                'active_milestone_name': 'room', 'previous_milestone': 'start',
+                'transition_relation': 'door', 'object_name': 'chair', 'object_x': 2.0, 'object_y': 0.0,
                 'robot_x': 0.0, 'robot_y': 0.0, 'robot_yaw': 0.0,
-                'iliskili_obje': 'Yok', 'iliski_tanimi': 'Yok', 'ozellikler': 'red'}),
-            ('custom_memory_mcp', 'ltm_oku', {}),
-            ('autopilot_mcp', 'kognitif_rota_planla', {'baslangic_milestone': 'start', 'hedef_milestone': 'room'}),
-            ('autopilot_mcp', 'hedef_objeye_yonelme_hesapla', {'oda_adi': 'room', 'obje_adi': 'chair'}),
-            ('autopilot_mcp', 'otopilot_kademeli_hareket', {'hedef_aci_derece': 0.0, 'hedef_mesafe_metre': 0.0}),
-            ('custom_memory_mcp', 'stm_anlik_durum_guncelle', {'son_aksiyon': 'stop', 'delta_sonuc': 'ok', 'lokal_durum': 'clear', 'niyet': 'observe'}),
-            ('custom_memory_mcp', 'stm_oku', {}),
-            ('kartograf_mcp', 'harita_guncelle', {'mermaid_kodu': 'graph TD\n start --> room'}),
+                'related_object': 'None', 'relation_description': 'None', 'properties': 'red'}),
+            ('custom_memory_mcp', 'read_long_term_memory', {}),
+            ('autopilot_mcp', 'plan_topological_route', {'start_milestone': 'start', 'target_milestone': 'room'}),
+            ('autopilot_mcp', 'calculate_object_heading', {'room_name': 'room', 'object_name': 'chair'}),
+            ('autopilot_mcp', 'move_robot', {'target_angle_degrees': 0.0, 'target_distance_meters': 0.0}),
+            ('custom_memory_mcp', 'update_short_term_memory', {'last_action': 'stop', 'observed_delta': 'ok', 'local_state': 'clear', 'intention': 'observe'}),
+            ('custom_memory_mcp', 'read_short_term_memory', {}),
+            ('cartographer_mcp', 'update_map', {'mermaid_code': 'graph TD\n start --> room'}),
         ]
 
         async def invoke_chain():
@@ -242,10 +249,96 @@ class TraceTests(unittest.TestCase):
         self.assertEqual([r['tool'] for r in rows if r['event'] == 'tool_start'], [c[1] for c in chain])
         ends = [r for r in rows if r['event'] == 'tool_end']
         self.assertEqual(len(ends), len(chain))
-        self.assertTrue(all(r['status'] == 'returned' and 'HATA' not in str(r['cikti_ozet']) for r in ends))
+        self.assertTrue(all(r['status'] == 'returned' and "ERROR" not in str(r['output_summary']) for r in ends))
         self.assertTrue(all(m['linear']['x'] == 0 and m['angular']['z'] == 0 for m in published))
-        self.assertIn('room', Path(modules['kartograf_mcp'].MAP_FILE_PATH).read_text())
-        self.assertEqual(json.loads(Path(modules['custom_memory_mcp'].STM_FILE).read_text())[-1]['niyet'], 'observe')
+        self.assertIn('room', Path(modules['cartographer_mcp'].MAP_FILE_PATH).read_text())
+        self.assertEqual(json.loads(Path(modules['custom_memory_mcp'].STM_FILE).read_text())[-1]['intention'], 'observe')
+        memory = modules['custom_memory_mcp']
+        stored = json.loads(Path(memory.LTM_FILE).read_text())
+        self.assertIn({'source': 'start', 'target': 'room', 'relation': 'door'},
+                      stored['topological_graph'])
+        self.assertTrue(all(set(edge) == {'source', 'target', 'relation'}
+                            for edge in stored['topological_graph']))
+        chair = stored['content_tree']['room']['objects']['chair']
+        self.assertEqual(set(chair), {'x', 'y', 'observation_pose', 'properties',
+                                     'related_object', 'relation_description'})
+        self.assertIsNone(chair['related_object'])
+        self.assertIsNone(chair['relation_description'])
+        self.assertEqual(chair['properties'], 'red')
+
+    def test_detailed_camera_returns_decodable_image_over_mcp(self):
+        import base64
+        import hashlib
+        import io
+        from types import SimpleNamespace
+        from fastmcp import Client
+        from PIL import Image
+
+        class Ros:
+            is_connected = True
+            def __init__(self, **kwargs):
+                pass
+
+        subscriptions = []
+        frame = {}
+
+        class Topic:
+            def __init__(self, *args, **kwargs):
+                self.unsubscribed = False
+            def subscribe(self, callback):
+                subscriptions.append(self)
+                callback(frame)
+            def unsubscribe(self):
+                self.unsubscribed = True
+
+        spec = importlib.util.spec_from_file_location(
+            'offline_detailed_camera', MODULES / 'camera_mcp.py')
+        camera = importlib.util.module_from_spec(spec)
+        ros_patch = patch.multiple('roslibpy', Ros=Ros, Topic=Topic)
+        ros_patch.start()
+        self.addCleanup(ros_patch.stop)
+        spec.loader.exec_module(camera)
+
+        async def exercise_camera():
+            nonlocal frame
+            async with Client(camera.mcp) as client:
+                for size, expected_size in (((64, 32), (64, 32)),
+                                            ((2560, 1440), (1920, 1080))):
+                    with self.subTest(size=size):
+                        raw = Image.new('RGB', size, (200, 40, 80))
+                        frame = {'width': size[0], 'height': size[1], 'encoding': 'rgb8',
+                                 'step': size[0] * 3,
+                                 'data': base64.b64encode(raw.tobytes()).decode('ascii')}
+                        result = await client.call_tool('get_detailed_camera', {})
+                        self.assertFalse(result.is_error)
+                        self.assertEqual([item.type for item in result.content], ['text', 'image'])
+                        self.assertIn('Detailed Analysis Camera', result.content[0].text)
+                        image = result.content[1]
+                        self.assertEqual(image.mimeType, 'image/jpeg')
+                        with Image.open(io.BytesIO(base64.b64decode(image.data, validate=True))) as decoded:
+                            decoded.load()
+                            self.assertEqual(decoded.format, 'JPEG')
+                            self.assertEqual(decoded.size, expected_size)
+                            self.assertEqual(decoded.mode, 'RGB')
+                            self.assertTrue(all(abs(a - b) <= 3 for a, b in
+                                                zip(decoded.getpixel((0, 0)), (200, 40, 80))))
+                        self.assertTrue(subscriptions[-1].unsubscribed)
+                        trace = self.records(current_run())[-1]
+                        self.assertEqual(trace['tool'], 'get_detailed_camera')
+                        summary = trace['output_summary'][1]
+                        self.assertNotIn('data', summary)
+                        self.assertEqual(summary['base64_length'], len(image.data))
+                        self.assertEqual(summary['sha256_base64'],
+                                         hashlib.sha256(image.data.encode()).hexdigest())
+
+                # A malformed RGB frame must remain an error, never a fabricated image.
+                frame = {'width': 2, 'height': 2, 'data': 'YWJj'}
+                result = await client.call_tool('get_detailed_camera', {})
+                self.assertTrue(all(item.type == 'text' for item in result.content))
+                self.assertIn('ERROR: Raw image processing failed', result.content[0].text)
+                self.assertTrue(subscriptions[-1].unsubscribed)
+
+        asyncio.run(exercise_camera())
 
     def test_image_summary_excludes_base64(self):
         from mcp.types import ImageContent
@@ -254,7 +347,7 @@ class TraceTests(unittest.TestCase):
             return [ImageContent(type='image', mimeType='image/jpeg', data='YWJj')]
         result = camera()
         self.assertEqual(result[0].data, 'YWJj')
-        image = self.records(current_run())[-1]['cikti_ozet'][0]
+        image = self.records(current_run())[-1]['output_summary'][0]
         self.assertNotIn('data', image)
         self.assertEqual(image['base64_length'], 4)
         self.assertEqual(len(image['sha256_base64']), 64)
@@ -269,9 +362,9 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(result['total'], len(statuses))
 
     def test_successful_turn_does_not_hide_translation_timeout(self):
-        report = '- Dönüş: İstenen 0° (Gerçekleşen: 0°) başarıyla tamamlandı.\n⏱️ MESAFE TIMEOUT'
-        self.assertTrue(motion_completed(report, 'Dönüş'))
-        self.assertFalse(motion_completed(report, 'İlerleme'))
+        report = "- Turn: Requested 0 degrees (Measured: 0 degrees) completed successfully.\nDISTANCE TIMEOUT"
+        self.assertTrue(motion_completed(report, "Turn"))
+        self.assertFalse(motion_completed(report, "Translation"))
 
 
 if __name__ == '__main__':

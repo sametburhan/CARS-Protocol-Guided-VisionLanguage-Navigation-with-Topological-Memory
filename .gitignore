@@ -1,11 +1,9 @@
-# ==========================================
-# CARS — Kognitif Otonom Robot Sistemi
-# ==========================================
+# CARS - Cognitive Autonomous Robot System
 
-# Çalışma zamanında üretilen bellek/harita/log dosyaları
+# Generated runtime memory, maps, and logs
 memory/
 logs/
-kognitif_harita.md
+cognitive_map.md
 current_run.txt
 *.jsonl
 
@@ -19,36 +17,36 @@ __pycache__/
 build/
 dist/
 
-# Harici repolar
+# External repositories and local ROS packages
 ros-mcp-server/
-src/ 
+src/
 
-# Sanal ortamlar
+# Virtual environments
 venv/
 .venv/
 env/
 ENV/
 
-# ROS 2 workspace derleme artefaktları (eğer repo bir ros2_ws kökündeyse)
+# ROS 2 workspace build artifacts
 ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
 
-# Editör / IDE
+# Editors and IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# İşletim sistemi
+# Operating systems
 .DS_Store
 Thumbs.db
 
-# Ortam değişkenleri / sırlar
+# Environment variables and secrets
 .env
 *.pem
 *.key
 
-# Test çıktıları
+# Test output
 tests/*.log
 tests/__pycache__/

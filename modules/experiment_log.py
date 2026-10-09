@@ -72,8 +72,8 @@ def safe_value(value):
 def _append(directory, run_id, event):
     sequence_path = directory / f'run_{run_id}.seq'
     sequence = int(sequence_path.read_text()) + 1 if sequence_path.exists() else 1
-    record = dict(event, schema_version=1, run_id=run_id, seq=sequence,
-                  zaman=datetime.now(timezone.utc).isoformat(), pid=os.getpid())
+    record = dict(event, schema_version=2, run_id=run_id, seq=sequence,
+                  timestamp=datetime.now(timezone.utc).isoformat(), pid=os.getpid())
     line = json.dumps(safe_value(record), ensure_ascii=False, allow_nan=False) + '\n'
     # Reserve before append: a crash can leave a gap, never a duplicate sequence.
     atomic_text(sequence_path, str(sequence))
@@ -117,6 +117,26 @@ def write_event(event, run_id=None):
         return _append(directory, validate_run_id(run_id) if run_id else _active(directory), event)
 
 
+MEMORY_TOOLS = {
+    'save_long_term_memory': ('ltm', 'write'),
+    'record_beyond_passage_observation': ('ltm', 'write'),
+    'read_long_term_memory': ('ltm', 'read'),
+    'update_short_term_memory': ('stm', 'write'),
+    'read_short_term_memory': ('stm', 'read'),
+}
+
+
+def memory_metrics(tool, payload):
+    if tool not in MEMORY_TOOLS:
+        return None
+    text = payload if isinstance(payload, str) else json.dumps(
+        safe_value(payload), ensure_ascii=False, separators=(',', ':'))
+    store, operation = MEMORY_TOOLS[tool]
+    return {'store': store, 'operation': operation,
+            'payload': {'characters': len(text), 'utf8_bytes': len(text.encode('utf-8'))},
+            'tokens': None, 'token_source': 'unavailable_at_mcp_boundary'}
+
+
 def logged_tool(server):
     """Apply BELOW @mcp.tool() so FastMCP keeps the original tool signature."""
     def decorate(function):
@@ -126,16 +146,18 @@ def logged_tool(server):
             bound = signature.bind(*args, **kwargs)
             bound.apply_defaults()
             return write_event({'event': 'tool_start', 'call_id': uuid.uuid4().hex,
-                                'sunucu': server, 'tool': function.__name__,
-                                'girdi': safe_value(bound.arguments)})
+                                'server': server, 'tool': function.__name__,
+                                'inputs': safe_value(bound.arguments),
+                                'memory_metrics': memory_metrics(function.__name__, bound.arguments)})
 
         def finish(start, began, result=None, error=None):
             write_event({'event': 'tool_end', 'call_id': start['call_id'],
-                         'sunucu': server, 'tool': function.__name__,
+                         'server': server, 'tool': function.__name__,
                          'status': 'exception' if error is not None else 'returned',
-                         'cikti_ozet': safe_value(result),
+                         'output_summary': safe_value(result),
+                         'memory_metrics': memory_metrics(function.__name__, result if error is None else ''),
                          'error': {'type': type(error).__name__, 'message': str(error)} if error is not None else None,
-                         'sure_s': round(time.monotonic() - began, 6)}, start['run_id'])
+                         'duration_seconds': round(time.monotonic() - began, 6)}, start['run_id'])
 
         @wraps(function)
         def synchronous(*args, **kwargs):
